@@ -36,6 +36,7 @@ local WINDOW_ENABLE_KEYS = {
     achievements    = "reskinAchievements",
     mail            = "reskinMail",
     catalyst        = "reskinCatalyst",
+    itemupgrade     = "reskinItemUpgrade",
     socket          = "reskinSocket",
     micromenu       = "reskinMicroMenu",
     housing         = "reskinHousing",
