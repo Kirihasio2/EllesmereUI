@@ -2956,6 +2956,12 @@ initFrame:SetScript("OnEvent", function(self)
             return t.bars[_tbbSelectedBar]
         end
 
+        local function SelectedTBBSupportsChargeHash()
+            local bd = SelectedTBB()
+            return bd and ns.GetTBBMaxCharges
+                and ns.GetTBBMaxCharges(bd) ~= nil
+        end
+
         -- Validate the group selection against the live group list (groups
         -- dissolve when their last bar is deleted).
         if _tbbSelectedGroup then
@@ -4845,25 +4851,111 @@ initFrame:SetScript("OnEvent", function(self)
             })
         end
 
-        -- Smooth Bars: PROFILE-wide checkbox dropdown (all bars, all specs
-        -- -- deliberately NOT per bar or per spec). Buffs = buff mirrors +
-        -- self-timed presets; Cooldowns = cooldown-tracking bars. Read by
-        -- the tick each pass, so changes apply instantly with no rebuild.
+        -- Charge Hash Lines | Smooth Bars. The number and orientation of hash
+        -- separators are resolved automatically from the tracked spell's max
+        -- charges. Smooth Bars remains profile-wide rather than per bar/spec.
         local SMOOTH_ITEMS = {
             { key = "buffs",     label = "Buffs" },
             { key = "cooldowns", label = "Cooldowns" },
         }
         local SMOOTH_DEFAULT = { buffs = true, cooldowns = false }
-        local smoothRow
-        smoothRow, h = W:DualRow(parent, y,
+        local chargeHashRow
+        chargeHashRow, h = W:DualRow(parent, y,
+            { type = "toggle", text = "Charge Hash Lines",
+              tooltip = "Divides a cooldown-tracking bar into one recovery section per ability charge. The timer shows the next charge's cooldown.",
+              disabled = function()
+                  local bd = SelectedTBB()
+                  return not bd or bd.trackType ~= "cooldown"
+                      or not SelectedTBBSupportsChargeHash()
+              end,
+              disabledTooltip = function()
+                  local bd = SelectedTBB()
+                  if not bd or bd.trackType ~= "cooldown" then
+                      return "This option requires a cooldown-tracking bar"
+                  end
+                  return "This option is only available for abilities with multiple charges"
+              end,
+              getValue = function()
+                  local bd = SelectedTBB()
+                  return bd and bd.chargeHashLines == true
+                      and SelectedTBBSupportsChargeHash()
+              end,
+              setValue = function(v)
+                  local bd = SelectedTBB(); if not bd then return end
+                  if v and not SelectedTBBSupportsChargeHash() then return end
+                  bd.chargeHashLines = v and true or nil
+                  RefreshTBB(); EllesmereUI:RefreshPage()
+              end },
             { type = "dropdown", text = "Smooth Bars",
               tooltip = "Eases bar movement instead of snapping. Affects all Tracking Bars of that type, in every spec of this profile.",
               values = { __placeholder = "..." }, order = { "__placeholder" },
               getValue = function() return "__placeholder" end,
-              setValue = function() end },
-            { type = "label", text = "" });  y = y - h
+              setValue = function() end });  y = y - h
         do
-            local rgn = smoothRow._leftRegion
+            local rgn = chargeHashRow._leftRegion
+            local _, cogShow = EllesmereUI.BuildCogPopup({
+                title = "Charge Hash Line Settings",
+                rows = {
+                    { type = "slider", label = "Line Width", min = 1, max = 10, step = 1,
+                      get = function()
+                          local bd = SelectedTBB()
+                          return bd and bd.chargeHashLineWidth or 2
+                      end,
+                      set = function(v)
+                          local bd = SelectedTBB(); if not bd then return end
+                          bd.chargeHashLineWidth = v
+                          RefreshTBB()
+                      end },
+                    { type = "colorpicker", label = "Line Color", hasAlpha = true,
+                      get = function()
+                          local bd = SelectedTBB()
+                          if not bd then return 0, 0, 0, 1 end
+                          local a = bd.chargeHashLineA
+                          if a == nil then a = 1 end
+                          return bd.chargeHashLineR or 0, bd.chargeHashLineG or 0,
+                              bd.chargeHashLineB or 0, a
+                      end,
+                      set = function(r, g, b, a)
+                          local bd = SelectedTBB(); if not bd then return end
+                          bd.chargeHashLineR, bd.chargeHashLineG = r, g
+                          bd.chargeHashLineB, bd.chargeHashLineA = b, a
+                          RefreshTBB()
+                      end },
+                },
+            })
+            local cogBtn = MakeCogBtn(rgn, cogShow, nil, EllesmereUI.COGS_ICON)
+            local cogBlock = CreateFrame("Frame", nil, cogBtn)
+            cogBlock:SetAllPoints()
+            cogBlock:SetFrameLevel(cogBtn:GetFrameLevel() + 10)
+            cogBlock:EnableMouse(true)
+            cogBlock:SetScript("OnEnter", function()
+                local bd = SelectedTBB()
+                local tip
+                if not bd or bd.trackType ~= "cooldown" then
+                    tip = "This option requires a cooldown-tracking bar"
+                elseif not SelectedTBBSupportsChargeHash() then
+                    tip = "This option is only available for abilities with multiple charges"
+                else
+                    tip = "Enable Charge Hash Lines first"
+                end
+                EllesmereUI.ShowWidgetTooltip(cogBtn, tip)
+            end)
+            cogBlock:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+            local function UpdateChargeHashCog()
+                local bd = SelectedTBB()
+                local disabled = not bd or bd.trackType ~= "cooldown"
+                    or not SelectedTBBSupportsChargeHash()
+                    or bd.chargeHashLines ~= true
+                cogBtn:SetAlpha(disabled and 0.15 or 0.4)
+                if disabled then cogBlock:Show() else cogBlock:Hide() end
+            end
+            cogBtn:HookScript("OnShow", UpdateChargeHashCog)
+            EllesmereUI.RegisterWidgetRefresh(UpdateChargeHashCog)
+            UpdateChargeHashCog()
+        end
+
+        do
+            local rgn = chargeHashRow._rightRegion
             if rgn._control then rgn._control:Hide() end
             local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
                 rgn, 210, rgn:GetFrameLevel() + 2,
