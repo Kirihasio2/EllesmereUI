@@ -2217,7 +2217,8 @@ local specialsActive = inInstance or co.showSpecialsNonInstanced
                         local isLethal = (poison.cat == "lethal")
                         if isLethal then knownL = knownL + 1 else knownNL = knownNL + 1 end
                         local aura = C_UnitAuras.GetPlayerAuraBySpellID(poison.castSpell)
-                        if aura then
+                        local active = aura and not IsUnderDuration(aura.duration, aura.expirationTime)
+                        if active then
                             if isLethal then activeL = activeL + 1 else activeNL = activeNL + 1 end
                         elseif co.enabled[poison.key] then
                             if isLethal and not missingL then missingL = poison
@@ -3036,7 +3037,7 @@ local function RegisterUnlockElements()
             end,
             linkedDimensions = true,
             setWidth = function(_, newW)
-                if not EllesmereUI._unlockActive then return end
+                if not EllesmereUI._unlockActive and not EllesmereUI._unlockLayerApplying then return end
                 local p = db.profile.display
                 local spacing = p.iconSpacing or 8
                 local count = max(#activeIcons, 2)
@@ -3046,7 +3047,7 @@ local function RegisterUnlockElements()
                 if _G._EABR_RequestRefresh then _G._EABR_RequestRefresh() end
             end,
             setHeight = function(_, newH)
-                if not EllesmereUI._unlockActive then return end
+                if not EllesmereUI._unlockActive and not EllesmereUI._unlockLayerApplying then return end
                 local p = db.profile.display
                 local textH = 0
                 if p.showText then

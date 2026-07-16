@@ -1166,6 +1166,11 @@ initFrame:SetScript("OnEvent", function(self)
                         local sbt = bf:CreateTexture(nil, "OVERLAY", nil, 6)
                         sbt:SetAllPoints(bf)
                         sbt:SetTexture(SHAPE_BORDERS[btnShape])
+                        -- Direct ref for the accent/hover tint sites below. Never
+                        -- locate this texture by scanning GetRegions: a freshly
+                        -- tracked CD's icon region carries secret values, and
+                        -- GetDrawLayer comparisons on it error out mid page-build.
+                        bf._sbt = sbt
                         if brdSize > 0 then
                             local cr, cg, cb = brdColor.r, brdColor.g, brdColor.b
                             if brdClassColor then
@@ -1223,11 +1228,8 @@ initFrame:SetScript("OnEvent", function(self)
                 if isSelected then
                     if isCustomShape then
                         -- Tint shape border to accent color
-                        for _, region in ipairs({bf:GetRegions()}) do
-                            if region:IsObjectType("Texture") and region:GetTexture() and SHAPE_BORDERS and SHAPE_BORDERS[btnShape]
-                               and region:GetDrawLayer() == "OVERLAY" then
-                                region:SetVertexColor(ACCENT.r, ACCENT.g, ACCENT.b, 1)
-                            end
+                        if bf._sbt then
+                            bf._sbt:SetVertexColor(ACCENT.r, ACCENT.g, ACCENT.b, 1)
                         end
                     elseif accentBrd then
                         accentBrd:Show()
@@ -1237,11 +1239,8 @@ initFrame:SetScript("OnEvent", function(self)
                 -- Show white border for assigned buttons (even if not active)
                 if hasAssign and not isSelected then
                     if isCustomShape then
-                        for _, region in ipairs({bf:GetRegions()}) do
-                            if region:IsObjectType("Texture") and region:GetTexture() and SHAPE_BORDERS and SHAPE_BORDERS[btnShape]
-                               and region:GetDrawLayer() == "OVERLAY" then
-                                region:SetVertexColor(1, 1, 1, 0.6)
-                            end
+                        if bf._sbt then
+                            bf._sbt:SetVertexColor(1, 1, 1, 0.6)
                         end
                     elseif accentBrd then
                         accentBrd:Show()
@@ -1262,15 +1261,7 @@ initFrame:SetScript("OnEvent", function(self)
                 -- Hover highlight: switch border to accent on hover
                 -- Active button doesn't need hover (already accent)
                 -- Store shape border ref for hover tinting
-                bf._shapeBorderTex = nil
-                if isCustomShape and SHAPE_BORDERS and SHAPE_BORDERS[btnShape] then
-                    for _, region in ipairs({bf:GetRegions()}) do
-                        if region:IsObjectType("Texture") and region:GetDrawLayer() == "OVERLAY" then
-                            bf._shapeBorderTex = region
-                            break
-                        end
-                    end
-                end
+                bf._shapeBorderTex = isCustomShape and bf._sbt or nil
                 local origBrdR, origBrdG, origBrdB, origBrdA = brdColor.r, brdColor.g, brdColor.b, brdColor.a or 1
                 if isCDMBar and cdmBd then
                     origBrdR = cdmBd.borderR or 0
@@ -1411,7 +1402,16 @@ initFrame:SetScript("OnEvent", function(self)
 
         -- Live-update preview icons when the action bar pages (stance shift,
         -- dragonriding, mount/dismount, vehicle, etc.)
-        do
+        --
+        -- Skipped during a hidden search pre-build: this listener is cleaned
+        -- up via parent:HookScript("OnHide", ...), which depends on the
+        -- pre-build wrapper's OnHide actually firing when hidden -- not
+        -- guaranteed, since the wrapper is parented under an already-hidden
+        -- frame and never becomes effectively visible in between. If it
+        -- doesn't fire, this listener (and the RefreshPage(true) it queues
+        -- on every action-bar-page/mount change) would leak for the rest of
+        -- the session. There's nothing to preview during indexing anyway.
+        if not EllesmereUI._prebuilding then
             local pageListener = CreateFrame("Frame")
             local pagePending = false
             pageListener:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
@@ -1938,11 +1938,27 @@ initFrame:SetScript("OnEvent", function(self)
         return p > 0 and (p + 8) or 0
     end
 
-    local function RefreshTBBPopout()
-        -- Only while the Tracking Bars page is in front
+    -- HARD gate for BOTH Tracking Bars preview systems (popout preview and
+    -- unlock-style placeholders): they must never be visible unless the
+    -- options panel is actually OPEN on the Tracking Bars page. Checking
+    -- activeModule/activePage alone is NOT enough -- both persist after the
+    -- panel closes, and RefreshPage / event-driven refreshes (saved
+    -- positions, spec or instance events) rebuild this page with the panel
+    -- hidden. Every show path funnels through this check.
+    local function TBBPreviewAllowed()
+        if not (EllesmereUI.IsShown and EllesmereUI:IsShown()) then return false end
+        -- nil = mid-build (page state not stamped yet); builders only run for
+        -- the page being shown, so only a definite mismatch blocks.
         local am = EllesmereUI.GetActiveModule and EllesmereUI:GetActiveModule()
         local ap = EllesmereUI.GetActivePage and EllesmereUI:GetActivePage()
         if am and ap and (am ~= "EllesmereUICooldownManager" or ap ~= PAGE_BUFF_BARS) then
+            return false
+        end
+        return true
+    end
+
+    local function RefreshTBBPopout()
+        if not TBBPreviewAllowed() then
             HideTBBPopout()
             return
         end
@@ -1972,8 +1988,8 @@ initFrame:SetScript("OnEvent", function(self)
             local wrap = _tbbPopoutBars[n]
             if not wrap then
                 wrap = ns.CreateTBBBarFrame(oc, "Pv" .. n)
-                -- The live constructor pins MEDIUM strata; lift the preview
-                -- into the popout's strata and re-assert the child levels the
+                -- The live constructor pins HIGH strata; lift the preview into
+                -- the popout's strata and re-assert the child levels the
                 -- constructor established (a parent strata change can reset
                 -- child frame levels).
                 wrap:SetFrameStrata("FULLSCREEN_DIALOG")
@@ -1982,7 +1998,7 @@ initFrame:SetScript("OnEvent", function(self)
                 local sb = wrap._bar
                 if sb then sb:SetFrameLevel(base + 1) end
                 if wrap._sparkOverlay and sb then wrap._sparkOverlay:SetFrameLevel(sb:GetFrameLevel() + 2) end
-                if wrap._textOverlay and sb then wrap._textOverlay:SetFrameLevel(sb:GetFrameLevel() + 6) end
+                if wrap._textOverlay and sb then wrap._textOverlay:SetFrameLevel(sb:GetFrameLevel() + 7) end
                 if wrap._pandemicGlowOverlay then wrap._pandemicGlowOverlay:SetFrameLevel(base + 7) end
                 _tbbPopoutBars[n] = wrap
             end
@@ -2100,6 +2116,17 @@ initFrame:SetScript("OnEvent", function(self)
     -- Pool of unlock placeholders, one per bar (module-scope for cross-page access)
     local _tbbPlaceholders = {}
     local function UpdateTBBPlaceholder()
+        -- Same hard gate as the popout: never show (and never set placeholder
+        -- mode) with the panel closed or another page in front. Inline hide --
+        -- HideTBBPlaceholder is declared below this function.
+        if not TBBPreviewAllowed() then
+            ns._tbbPlaceholderMode = false
+            for _, ph in ipairs(_tbbPlaceholders) do
+                if ph then ph:Hide() end
+            end
+            HideTBBPopout()
+            return
+        end
         ns._tbbPlaceholderMode = true
         local tbb = ns.GetTrackedBuffBars()
         local bars = tbb and tbb.bars
@@ -2396,6 +2423,7 @@ initFrame:SetScript("OnEvent", function(self)
             barCfg.spellIDs       = nil
             barCfg.popularKey     = nil
             barCfg.glowBased      = nil
+            barCfg.trackType      = nil
             barCfg.customDuration = dur
             -- Manually-entered id: no live frame to read the base from. Clear any
             -- stale base; MatchFrameToConfig self-heals it if/when talented.
@@ -2452,7 +2480,7 @@ initFrame:SetScript("OnEvent", function(self)
         local mH = 4
 
         -- "Custom Buff ID" entry at the top
-        local isCustomSelected = barCfg.spellID and barCfg.spellID > 0 and not barCfg.popularKey and not barCfg.spellIDs
+        local isCustomSelected = barCfg.spellID and barCfg.spellID > 0 and not barCfg.popularKey and not barCfg.spellIDs and barCfg.trackType ~= "cooldown"
         local csItem = CreateFrame("Button", nil, inner)
         csItem:SetHeight(ITEM_H)
         csItem:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH)
@@ -2531,6 +2559,7 @@ initFrame:SetScript("OnEvent", function(self)
                 barCfg.customDuration = entry.customDuration
                 barCfg.spellID        = entry.spellIDs and entry.spellIDs[1] or 0
                 barCfg.baseSpellID    = nil
+                barCfg.trackType      = nil
                 barCfg.name           = entry.name
                 Refresh()
                 ns.BuildTrackedBuffBars()
@@ -2564,6 +2593,7 @@ initFrame:SetScript("OnEvent", function(self)
             -- Check if spell is already on another Tracking Bar
             local usedOnBar = ns.SpellUsedOnAnyOtherTBB and ns.SpellUsedOnAnyOtherTBB(sp.spellID, nil)
             local isSelected = not barCfg.popularKey and not barCfg.spellIDs
+                             and barCfg.trackType ~= "cooldown"
                              and barCfg.spellID and barCfg.spellID > 0 and barCfg.spellID == sp.spellID
             local item = CreateFrame("Button", nil, inner)
             item:SetHeight(ITEM_H)
@@ -2635,6 +2665,7 @@ initFrame:SetScript("OnEvent", function(self)
                 barCfg.popularKey     = nil
                 barCfg.glowBased      = nil
                 barCfg.customDuration = nil
+                barCfg.trackType      = nil
                 barCfg.name           = sp.name
                 -- Capture the BASE spell id for hero-talent override spells so
                 -- the bar keeps tracking after the talent is removed. When the
@@ -2656,6 +2687,121 @@ initFrame:SetScript("OnEvent", function(self)
         end
 
         for _, sp in ipairs(trackedBars) do MakeSpellItem(sp) end
+
+        -- "Cooldowns" section: pick a spell COOLDOWN to track instead of a
+        -- buff (cfg.trackType = "cooldown"). Sourced from the Essential +
+        -- Utility pools plus the settings catalog. Skipped entirely when the
+        -- list is empty so the picker stays identical to before.
+        local cdSpells = ns.GetCDMSpellsForBar and ns.GetCDMSpellsForBar("cooldowns") or {}
+        if #cdSpells > 0 then
+            local cdDiv = inner:CreateTexture(nil, "ARTWORK")
+            cdDiv:SetHeight(1); cdDiv:SetColorTexture(1, 1, 1, 0.10)
+            cdDiv:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH - 4)
+            cdDiv:SetPoint("TOPRIGHT", inner, "TOPRIGHT", -1, -mH - 4)
+            mH = mH + 9
+
+            local cdHdr = inner:CreateFontString(nil, "OVERLAY")
+            cdHdr:SetFont(FONT_PATH, 10, GetCDMOptOutline())
+            cdHdr:SetTextColor(1, 1, 1, 0.5)
+            cdHdr:SetPoint("TOPLEFT", inner, "TOPLEFT", 10, -mH - 5)
+            cdHdr:SetText(EllesmereUI.L("Cooldowns"))
+            mH = mH + 20
+
+            local function MakeCooldownItem(sp)
+                -- Gray-out check is scoped to OTHER cooldown-tracking bars:
+                -- a buff bar for the same spell never blocks this pick.
+                local usedOnBar = ns.SpellUsedOnAnyOtherTBB and ns.SpellUsedOnAnyOtherTBB(sp.spellID, nil, "cooldown")
+                local isSelected = barCfg.trackType == "cooldown"
+                                 and not barCfg.popularKey and not barCfg.spellIDs
+                                 and barCfg.spellID and barCfg.spellID > 0 and barCfg.spellID == sp.spellID
+                local item = CreateFrame("Button", nil, inner)
+                item:SetHeight(ITEM_H)
+                item:SetPoint("TOPLEFT", inner, "TOPLEFT", 1, -mH)
+                item:SetPoint("TOPRIGHT", inner, "TOPRIGHT", -1, -mH)
+                item:SetFrameLevel(menu:GetFrameLevel() + 2)
+
+                local ico = item:CreateTexture(nil, "ARTWORK")
+                local icoSz = ITEM_H - 4
+                ico:SetSize(icoSz, icoSz)
+                ico:SetPoint("RIGHT", item, "RIGHT", -6, 0)
+                if sp.icon then ico:SetTexture(sp.icon) end
+                ico:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+                local baseR = isSelected and 1 or tDimR
+                local baseG = isSelected and 1 or tDimG
+                local baseB = isSelected and 1 or tDimB
+                local baseA = isSelected and 1 or tDimA
+
+                local lbl = item:CreateFontString(nil, "OVERLAY")
+                lbl:SetFont(FONT_PATH, 11, GetCDMOptOutline())
+                lbl:SetPoint("LEFT", 8, 0)
+                lbl:SetPoint("RIGHT", ico, "LEFT", -4, 0)
+                lbl:SetJustifyH("LEFT")
+                lbl:SetWordWrap(false); lbl:SetMaxLines(1)
+                lbl:SetText(EllesmereUI.L(sp.name))
+                lbl:SetTextColor(baseR, baseG, baseB, baseA)
+
+                local hl = item:CreateTexture(nil, "ARTWORK", nil, -1)
+                hl:SetAllPoints()
+                hl:SetColorTexture(1, 1, 1, isSelected and 0.12 or 0)
+
+                -- Gray out if already used on another cooldown-tracking bar
+                if usedOnBar and not isSelected then
+                    lbl:SetTextColor(tDimR, tDimG, tDimB, tDimA * 0.4)
+                    ico:SetDesaturated(true); ico:SetAlpha(0.4)
+                    item:SetScript("OnEnter", function()
+                        EllesmereUI.ShowWidgetTooltip(item, EllesmereUI.Lf("Already assigned to %s", EllesmereUI.L(usedOnBar)))
+                        hl:SetColorTexture(1, 1, 1, hlA * 0.3); hl:SetAlpha(1)
+                    end)
+                    item:SetScript("OnLeave", function()
+                        EllesmereUI.HideWidgetTooltip()
+                        hl:SetAlpha(0)
+                    end)
+                    mH = mH + ITEM_H
+                    return
+                end
+
+                -- Untalented catalog spells stay clickable but render
+                -- desaturated with a hint, matching the buff rows above.
+                local notLearned = (sp.isKnown == false)
+                if notLearned then ico:SetDesaturated(true); ico:SetAlpha(0.5) end
+                item:SetScript("OnEnter", function()
+                    lbl:SetTextColor(1,1,1,1); hl:SetColorTexture(1,1,1,hlA)
+                    if notLearned then EllesmereUI.ShowWidgetTooltip(item, EllesmereUI.L("Not currently talented")) end
+                end)
+                item:SetScript("OnLeave", function()
+                    lbl:SetTextColor(baseR, baseG, baseB, baseA)
+                    hl:SetColorTexture(1, 1, 1, isSelected and 0.12 or 0)
+                    if notLearned then EllesmereUI.HideWidgetTooltip() end
+                end)
+                item:SetScript("OnClick", function()
+                    if notLearned then EllesmereUI.HideWidgetTooltip() end
+                    menu:Hide()
+                    barCfg.spellID        = sp.spellID
+                    barCfg.spellIDs       = nil
+                    barCfg.popularKey     = nil
+                    barCfg.glowBased      = nil
+                    barCfg.customDuration = nil
+                    barCfg.trackType      = "cooldown"
+                    barCfg.name           = sp.name
+                    -- Capture the BASE spell id for hero-talent override spells
+                    -- so the bar keeps tracking after the talent is removed.
+                    barCfg.baseSpellID = nil
+                    if sp.cdID and C_CooldownViewer and C_CooldownViewer.GetCooldownViewerCooldownInfo then
+                        local info = C_CooldownViewer.GetCooldownViewerCooldownInfo(sp.cdID)
+                        if info and info.spellID and info.spellID > 0 and info.spellID ~= sp.spellID then
+                            barCfg.baseSpellID = info.spellID
+                        end
+                    end
+                    Refresh()
+                    ns.BuildTrackedBuffBars()
+                    if onChanged then onChanged() end
+                end)
+                mH = mH + ITEM_H
+            end
+
+            for _, sp in ipairs(cdSpells) do MakeCooldownItem(sp) end
+        end
 
         -- "Missing Spells?" footer: centered, accent-colored prompt that opens
         -- Blizzard's CDM and closes EUI options, matching the CD/utility picker.
@@ -4697,6 +4843,44 @@ initFrame:SetScript("OnEvent", function(self)
                     RefreshTBB(); EllesmereUI:RefreshPage()
                 end,
             })
+        end
+
+        -- Smooth Bars: PROFILE-wide checkbox dropdown (all bars, all specs
+        -- -- deliberately NOT per bar or per spec). Buffs = buff mirrors +
+        -- self-timed presets; Cooldowns = cooldown-tracking bars. Read by
+        -- the tick each pass, so changes apply instantly with no rebuild.
+        local SMOOTH_ITEMS = {
+            { key = "buffs",     label = "Buffs" },
+            { key = "cooldowns", label = "Cooldowns" },
+        }
+        local SMOOTH_DEFAULT = { buffs = true, cooldowns = false }
+        local smoothRow
+        smoothRow, h = W:DualRow(parent, y,
+            { type = "dropdown", text = "Smooth Bars",
+              tooltip = "Eases bar movement instead of snapping. Affects all Tracking Bars of that type, in every spec of this profile.",
+              values = { __placeholder = "..." }, order = { "__placeholder" },
+              getValue = function() return "__placeholder" end,
+              setValue = function() end },
+            { type = "label", text = "" });  y = y - h
+        do
+            local rgn = smoothRow._leftRegion
+            if rgn._control then rgn._control:Hide() end
+            local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
+                rgn, 210, rgn:GetFrameLevel() + 2,
+                SMOOTH_ITEMS,
+                function(k)
+                    local s = ns.GetTBBSmoothSettings and ns.GetTBBSmoothSettings()
+                    if not s or s[k] == nil then return SMOOTH_DEFAULT[k] end
+                    return s[k] == true
+                end,
+                function(k, v)
+                    local s = ns.GetTBBSmoothSettings and ns.GetTBBSmoothSettings()
+                    if s then s[k] = v and true or false end
+                end)
+            PP.Point(cbDD, "RIGHT", rgn, "RIGHT", -20, 0)
+            rgn._control = cbDD
+            rgn._lastInline = nil
+            EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
         end
 
         -------------------------------------------------------------------
@@ -8225,20 +8409,8 @@ initFrame:SetScript("OnEvent", function(self)
                             if not ctx then return end
                             local val = ctx.valueOf and ctx.valueOf()
                             local keys = ctx.keys or {}
-                            -- On an EXCLUDED spell the flyout sits on the bar's own value,
-                            -- so Apply to Bar / All Specs here means "rejoin the bar" -- the
-                            -- same as Include This Spell. Do that instead of re-applying the
-                            -- value already on the bar (which would just toggle it off).
-                            if AB.KeysBarApplied(keys) and AB.SpellHasOwn(keys) then
-                                AB.IncludeSpell(keys)
-                                if ns.RefreshCDMIconAppearance then ns.RefreshCDMIconAppearance(barKey) end
-                                if ns.QueueReanchor then ns.QueueReanchor() end
-                                if ctx.refresh then ctx.refresh() end
-                                if s._updateActive then s._updateActive() end
-                                return
-                            end
-                            -- Simulate the write once: drives the toggle-off check
-                            -- and the replace warning below.
+                            -- Simulate the write once: drives the rejoin match test,
+                            -- the toggle-off check, and the replace warning below.
                             local temp = {}
                             if ctx.write then ctx.write(temp, val) end
                             local scopeT
@@ -8256,6 +8428,25 @@ initFrame:SetScript("OnEvent", function(self)
                                 end
                                 if own ~= nil then scopeActive = true end
                                 if own ~= temp[k] then valuesMatch = false end
+                            end
+                            -- On an EXCLUDED spell the flyout sits on the bar's own value,
+                            -- so Apply to Bar / All Specs here means "rejoin the bar" -- the
+                            -- same as Include This Spell. Do that instead of re-applying the
+                            -- value already on the bar (which would just toggle it off).
+                            -- For a scalar popup value (Threshold Seconds) the flyout item is
+                            -- a fixed identifier, not the bar's number, so "sits on the bar's
+                            -- value" is only true when the entered number actually matches
+                            -- this scope's value -- rejoin then (keeps the bar apply for other
+                            -- spells); otherwise fall through and push the new number, which
+                            -- rejoining would silently discard.
+                            if AB.KeysBarApplied(keys) and AB.SpellHasOwn(keys)
+                               and (not ctx.scalarApply or (scopeActive and valuesMatch)) then
+                                AB.IncludeSpell(keys)
+                                if ns.RefreshCDMIconAppearance then ns.RefreshCDMIconAppearance(barKey) end
+                                if ns.QueueReanchor then ns.QueueReanchor() end
+                                if ctx.refresh then ctx.refresh() end
+                                if s._updateActive then s._updateActive() end
+                                return
                             end
                             -- Toggle OFF: clicking a scope that already holds this
                             -- exact value un-applies it. Binary toggles un-apply on
@@ -8719,7 +8910,13 @@ initFrame:SetScript("OnEvent", function(self)
                                     -- tracks the bar's value, never the spell's override). Settings
                                     -- with no bar apply show it on everything. "+ " toggles are never
                                     -- OR, so they keep it.
-                                    local suppressStrip = canApply and not (isChargeToggle or isActiveBorder or isFnToggle)
+                                    -- A scalar popup value (Threshold Seconds) has only one
+                                    -- item, so "the bar's value differs from this item" is
+                                    -- meaningless -- never suppress it, or Apply-to-Bar
+                                    -- vanishes the moment the entered number differs from the
+                                    -- bar's.
+                                    local suppressStrip = canApply and not item.scalarApply
+                                        and not (isChargeToggle or isActiveBorder or isFnToggle)
                                         and AB.KeysBarApplied(applyKeys) and not itemIsBarApplied()
                                     if suppressStrip then
                                         if menu._applyStrip then menu._applyStrip:Hide() end
@@ -8727,6 +8924,7 @@ initFrame:SetScript("OnEvent", function(self)
                                         AB.ShowApplyStripFor(si, {
                                             keys  = applyKeys,
                                             write = applyWrite,
+                                            scalarApply = item.scalarApply,
                                             isToggle = isChargeToggle or isActiveBorder or isFnToggle,
                                             -- Toggles: "Apply to Bar" ENABLES the feature
                                             -- on the bar (apply true). Disabling is the
@@ -9135,6 +9333,15 @@ initFrame:SetScript("OnEvent", function(self)
                         end
                         local TT_ITEMS = {
                             { val = "seconds", label = "Threshold Seconds",
+                              -- Scalar popup value (not a discrete flyout choice): the
+                              -- number lives in the store, entered via a popup, and
+                              -- applyWrite pushes the spell's current seconds live. The
+                              -- Apply-to-Bar strip must treat it as "always push my
+                              -- value", never as a discrete value item -- otherwise the
+                              -- rejoin shortcut discards the entered number and the
+                              -- suppress-strip rule hides the strip whenever the bar's
+                              -- number differs (see scalarApply guards below).
+                              scalarApply = true,
                               dynamicLabel = function()
                                   local base = EllesmereUI.L("Threshold Seconds")
                                   local s = armedSeconds()
@@ -13046,6 +13253,17 @@ initFrame:SetScript("OnEvent", function(self)
                 if GetTime() - dragEndTime < 0.2 then
                     return
                 end
+                -- Override editing sessions: per-spell settings and spell
+                -- placement are never part of the override system -- refuse
+                -- the interaction with an explanatory tooltip.
+                if EllesmereUI.SpecOverrides_EditSessionActive
+                   and EllesmereUI.SpecOverrides_EditSessionActive() then
+                    if EllesmereUI.ShowWidgetTooltip then
+                        EllesmereUI.ShowWidgetTooltip(self,
+                            "Per-spell settings are not part of the override system.")
+                    end
+                    return
+                end
                 local bd = SelectedCDMBar()
                 if not bd then return end
                 local isDefaultBuffs = (bd.key == "buffs")
@@ -13209,17 +13427,42 @@ initFrame:SetScript("OnEvent", function(self)
                     end
                     if dragMode == "swap" then
                         if insertIdx ~= dragIdx then
-                            if isDefBuffs then ns.SwapBuffDisplayOrder(dragIdx, insertIdx)
-                            else ns.SwapTrackedSpells(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(insertIdx)) end
-                            didChange = true
+                            if isDefBuffs then
+                                -- Slot -> stable-key translation: buffDisplayOrder
+                                -- keeps absent (talent-gapped) keys in place, so
+                                -- slot indices cannot address it directly.
+                                local sk = pf._buffSlotKeys
+                                if sk and ns.SwapBuffDisplayKeys
+                                   and ns.SwapBuffDisplayKeys(sk[dragIdx], sk[insertIdx]) then
+                                    didChange = true
+                                end
+                            else
+                                ns.SwapTrackedSpells(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(insertIdx))
+                                didChange = true
+                            end
                         end
                     else
                         local toIdx = insertIdx
                         if toIdx > dragIdx then toIdx = toIdx - 1 end
                         if toIdx ~= dragIdx then
-                            if isDefBuffs then ns.MoveBuffDisplayOrder(dragIdx, toIdx)
-                            else ns.MoveTrackedSpell(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(toIdx)) end
-                            didChange = true
+                            if isDefBuffs then
+                                local sk = pf._buffSlotKeys
+                                if sk and ns.MoveBuffDisplayKey then
+                                    -- Final rendered position toIdx = insert before
+                                    -- the key at toIdx among the OTHER rendered keys
+                                    -- (nil past the end = append after everything).
+                                    local rk, n = {}, 0
+                                    for i = 1, #sk do
+                                        if i ~= dragIdx then n = n + 1; rk[n] = sk[i] end
+                                    end
+                                    if ns.MoveBuffDisplayKey(sk[dragIdx], rk[toIdx]) then
+                                        didChange = true
+                                    end
+                                end
+                            else
+                                ns.MoveTrackedSpell(bd.key, BuffDataIdx(dragIdx), BuffDataIdx(toIdx))
+                                didChange = true
+                            end
                         end
                     end
 
@@ -13300,11 +13543,11 @@ initFrame:SetScript("OnEvent", function(self)
                 local sdDrag = ns.GetBarSpellData(bd.key)
                 local si = self._slotIdx
                 if bd.key == "buffs" then
-                    -- Default bar: order lives in buffDisplayOrder (seeded on drop).
-                    -- A slot is draggable if it shows a spell (_previewSpellID set)
-                    -- or already maps to a stored order entry.
-                    local order = sdDrag and sdDrag.buffDisplayOrder
-                    if not self._previewSpellID and not (order and order[si]) then return end
+                    -- Default bar: a slot is draggable if it renders a buff
+                    -- (_previewSpellID / a rendered stable key). buffDisplayOrder
+                    -- is NOT indexed by slot -- it keeps absent keys in place.
+                    if not self._previewSpellID
+                       and not (pf._buffSlotKeys and pf._buffSlotKeys[si]) then return end
                 else
                     local t = sdDrag and sdDrag.assignedSpells or {}
                     local di = BuffDataIdx(si)
@@ -13360,7 +13603,9 @@ initFrame:SetScript("OnEvent", function(self)
                     if tBd then
                         local sdT = ns.GetBarSpellData(tBd.key)
                         if tBd.key == "buffs" then
-                            if sdT and sdT.buffDisplayOrder then tCount = #sdT.buffDisplayOrder end
+                            -- Rendered slot count, NOT #buffDisplayOrder: the stored
+                            -- order keeps absent keys and can exceed what is shown.
+                            if pf._buffSlotKeys then tCount = #pf._buffSlotKeys end
                         elseif sdT and sdT.assignedSpells then
                             tCount = #sdT.assignedSpells
                         end
@@ -13391,6 +13636,15 @@ initFrame:SetScript("OnEvent", function(self)
 
             slot:SetScript("OnMouseDown", function(self, button)
                 if button ~= "LeftButton" then return end
+                -- Override editing sessions: spell placement never overrides.
+                if EllesmereUI.SpecOverrides_EditSessionActive
+                   and EllesmereUI.SpecOverrides_EditSessionActive() then
+                    if EllesmereUI.ShowWidgetTooltip then
+                        EllesmereUI.ShowWidgetTooltip(self,
+                            "Per-spell settings are not part of the override system.")
+                    end
+                    return
+                end
                 -- Buff-family drag-reorder: extra/custom buff bars reorder via
                 -- assignedSpells (1:1 preview), the default buffs bar via its
                 -- dedicated buffDisplayOrder (stable cooldownID-keyed, reconciled
@@ -13623,6 +13877,7 @@ initFrame:SetScript("OnEvent", function(self)
             -- stable spellID, never the live aura GetSpellID (secret/variant-drift).
             local trackedCd
             pf._buffDispGroups = nil
+            pf._buffSlotKeys = nil
             if bd.key == "buffs" then
                 if ns.ReconcileBuffDisplayOrder then ns.ReconcileBuffDisplayOrder() end
                 local entries = ns.CollectDefaultBuffTrackEntries
@@ -13639,13 +13894,19 @@ initFrame:SetScript("OnEvent", function(self)
                 else
                     for _, e in ipairs(entries) do finalKeys[#finalKeys + 1] = e.key end
                 end
+                -- Rendered slot i <-> stable key map for the drag/reorder code:
+                -- absent (talent-gapped) keys stay in buffDisplayOrder but render
+                -- no slot, so slot indices cannot address the array directly.
+                local slotKeys = {}
                 for _, key in ipairs(finalKeys) do
                     local e = byKey[key]
                     if e then
                         tracked[#tracked + 1] = e.sid
                         trackedCd[#tracked] = e.cdID
+                        slotKeys[#tracked] = key
                     end
                 end
+                pf._buffSlotKeys = slotKeys
                 local snap = {}
                 for i = 1, #finalKeys do snap[i] = finalKeys[i] end
                 pf._buffTrackedOrder = snap
@@ -14176,6 +14437,14 @@ initFrame:SetScript("OnEvent", function(self)
 
         local barData = bars[selectedCDMBarIndex]
         if not barData then return math.abs(yOffset) end
+
+        -- Tag every option registered while building this page with the
+        -- currently-selected bar, so a global-search jump to a bar-specific
+        -- setting (e.g. HoverCast/FocusKick-only options) can restore this
+        -- exact bar selection first via EllesmereUI._setCDMBar -- otherwise
+        -- the matched row wouldn't exist under whatever bar happens to be
+        -- selected when the player jumps there.
+        EllesmereUI._buildingSelector = { setter = EllesmereUI._setCDMBar, key = barData.key }
 
         -- Capture the key so closures can always look up the CURRENT bar data
         -- from the profile, avoiding stale-reference bugs when the bars array
@@ -14803,7 +15072,14 @@ initFrame:SetScript("OnEvent", function(self)
         EllesmereUI:SetContentHeader(_cdmHeaderBuilder)
 
         -- Refresh preview icons on mount/dismount (skyriding swaps action bar icons)
-        do
+        --
+        -- Skipped during a hidden search pre-build: same reasoning as the
+        -- pageListener above in BuildBarGlowsPage -- its OnHide-based cleanup
+        -- isn't guaranteed to fire for a wrapper that's never effectively
+        -- visible, which would otherwise leak this listener (and the
+        -- RefreshPage(true) it triggers on every mount/dismount) for the
+        -- rest of the session.
+        if not EllesmereUI._prebuilding then
             local mountListener = CreateFrame("Frame")
             mountListener:RegisterEvent("PLAYER_MOUNT_DISPLAY_CHANGED")
             mountListener:SetScript("OnEvent", function()
@@ -14891,15 +15167,13 @@ initFrame:SetScript("OnEvent", function(self)
         _, h = W:SectionHeader(parent, "BAR LAYOUT", y);  y = y - h
 
         -- Row 1: (Sync) Visibility | Visibility Options (checkbox dropdown)
-        local visRow, visH = W:DualRow(parent, y,
-            { type="dropdown", text="Visibility",
-              values = EllesmereUI.VIS_VALUES_CDM or EllesmereUI.VIS_VALUES,
-              order = EllesmereUI.VIS_ORDER_CDM or EllesmereUI.VIS_ORDER,
-              getValue=function() return BD().barVisibility or "always" end,
-              setValue=function(v)
-                  BD().barVisibility = v
+        -- Mouseover stays structurally absent for CDM bars (noMouseover),
+        -- matching the old VIS_VALUES_CDM list.
+        local visRow, visH = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
+            { getStore = BD, legacyKey = "barVisibility",
+              caps = { partyIncludesRaid = true, noMouseover = true, luaDragonriding = true },
+              onChanged = function()
                   ns.CDMApplyVisibility()
-                  EllesmereUI:RefreshPage()
               end },
             { type="dropdown", text="Visibility Options",
               values={ __placeholder = "..." }, order={ "__placeholder" },
@@ -14926,21 +15200,26 @@ initFrame:SetScript("OnEvent", function(self)
             EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
         end
 
-        -- Sync icon on Visibility (left)
+        -- Sync icon on Visibility (left) -- set-aware so multi-selections
+        -- compare and copy correctly (uniform caps across CDM bars).
         do
             local rgn = visRow._leftRegion
             EllesmereUI.BuildSyncIcon({
                 region  = rgn,
                 tooltip = "Apply Visibility to all Bars",
                 isSynced = function()
-                    local v = BD().barVisibility or "always"
+                    local src = BD()
                     local synced = true
-                    ForEachSyncBar(function(b) if (b.barVisibility or "always") ~= v then synced = false end end)
+                    ForEachSyncBar(function(b)
+                        if not EllesmereUI.VisSelectionEquals(src, "barVisibility", b, "barVisibility") then synced = false end
+                    end)
                     return synced
                 end,
                 onClick = function()
-                    local v = BD().barVisibility or "always"
-                    ForEachSyncBar(function(b) b.barVisibility = v end)
+                    local src = BD()
+                    ForEachSyncBar(function(b)
+                        if b ~= src then EllesmereUI.VisCopySelection(b, src, "barVisibility") end
+                    end)
                     ns.CDMApplyVisibility(); EllesmereUI:RefreshPage()
                 end,
             })
@@ -17301,6 +17580,30 @@ initFrame:SetScript("OnEvent", function(self)
         disabledPages = {},
         disabledPageTooltips = {},
         buildPage   = function(pageName, parent, yOffset)
+            -- ns._tbbPlaceholderMode / ns._cdmBarsPageOpen reflect whatever page
+            -- the player is REALLY looking at, not the pageName this particular
+            -- call happens to be building. During an off-screen search pre-build,
+            -- pageName cycles through all three pages regardless of the player's
+            -- actual page, so the "switched away" cleanup below (buff-bar
+            -- injection/removal, placeholder toggling, the settings tip) would
+            -- otherwise fire against whatever the player is really seeing. Only
+            -- the requested page's content needs to be built here for indexing.
+            --
+            -- PAGE_BUFF_BARS is skipped entirely (not dispatched through): its
+            -- builder unconditionally calls UpdateTBBPlaceholder() at its tail,
+            -- which fetches each REAL tracked-buff-bar frame via
+            -- ns.GetTBBFrame(i) (not scoped to `parent`) and forces it
+            -- :Show() with an unlock-mode placeholder attached -- building it
+            -- here would pop the player's live buff bars onto the screen. It's
+            -- indexed normally the first time the player visits it live.
+            if EllesmereUI._prebuilding then
+                if pageName == PAGE_CDM_BARS then
+                    return BuildCDMBarsPage(pageName, parent, yOffset)
+                elseif pageName == PAGE_BAR_GLOWS then
+                    return BuildBarGlowsPage(pageName, parent, yOffset)
+                end
+                return
+            end
             -- Clear TBB placeholders when switching to any non-Tracking Bars page
             if pageName ~= PAGE_BUFF_BARS and ns._tbbPlaceholderMode then
                 ns._tbbPlaceholderMode = false
@@ -17337,6 +17640,41 @@ initFrame:SetScript("OnEvent", function(self)
             end
             -- Tracking Bars has no content header (popout preview instead)
             return nil
+        end,
+        -- CDM Bars content is gated on whichever bar is currently selected
+        -- (e.g. FocusKick's "Nameplate Anchor"/"Focus Text Reminders" only
+        -- render while barData.key == "focuskick"), and the default selected
+        -- bar is whatever's first in the player's list -- almost never
+        -- FocusKick. Without this, a hidden pre-build only ever sees that one
+        -- default bar's options, so every other bar's unique settings stay
+        -- unsearchable until the player opens the dropdown and picks them
+        -- live. Build once per distinct bar *shape* (cooldowns/utility/buffs/
+        -- custom_buff/focuskick), not once per literal bar instance -- a
+        -- player can have several custom bars of the same shape with
+        -- identical available options, so indexing more than one of a shape
+        -- would just be a wasted rebuild.
+        getPrebuildVariants = function(pageName)
+            if pageName ~= PAGE_CDM_BARS then return nil end
+            local p = DB()
+            local bars = p and p.cdmBars and p.cdmBars.bars
+            if not bars or #bars == 0 then return nil end
+            local seenShapes = {}
+            local keys = {}
+            for _, b in ipairs(bars) do
+                local shape = (b.key == "focuskick") and "focuskick" or b.barType
+                if shape and not seenShapes[shape] then
+                    seenShapes[shape] = true
+                    keys[#keys + 1] = b.key
+                end
+            end
+            if selectedCDMBarIndex < 1 then selectedCDMBarIndex = 1 end
+            if selectedCDMBarIndex > #bars then selectedCDMBarIndex = #bars end
+            local currentBar = bars[selectedCDMBarIndex]
+            return {
+                setter = EllesmereUI._setCDMBar,
+                keys = keys,
+                currentKey = currentBar and currentBar.key,
+            }
         end,
         onPageCacheRestore = function(pageName)
             -- Same flag management as buildPage

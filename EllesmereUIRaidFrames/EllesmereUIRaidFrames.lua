@@ -35,24 +35,38 @@ ns.NICK_ADDON = ADDON_NAME:find("Standalone") and ADDON_NAME or "EllesmereUI"
 --  threat border renders behind them: debuffs, defensives/externals, private
 --  auras, dispel-type icons, and Buff Manager icons/squares/bars. Each aura
 --  unit renders its own children (cooldown/border/text) up to +5 above its base.
---  Only the target/hover border-raise and the marker carrier sit above the aura
---  band; name/health text (ns.LVL_TEXT) sits above the raised border; the marker
---  carrier also hosts ready-check / summon / rez icons above the text.
+--  Ordering (bottom to top): base border (+8/strips +9) -> hover/target raise
+--  (ns.LVL_RAISE, strips +11, covering the base/threat/dispel border strips) ->
+--  the text band (ns.LVL_TEXT: name/health text, role icon, leader crown) ->
+--  the aura band -> the marker carrier (also hosts ready-check / summon / rez
+--  icons). The raise deliberately stays BELOW the text band, so the target /
+--  hover border never covers text, and auras always draw over text -- in every
+--  state. Consequence: with overlapping frames (negative spacing) a neighbor's
+--  text/auras can clip the raised border; it only outranks neighbor BORDERS.
+--  Opt-out: the per-profile "Show Above Icons" toggle (name cog) lifts a
+--  button's text carrier to ns.LVL_AURA + 6, above the aura band's children.
 --  Kept on `ns` (not file-scope locals) to avoid the Lua 5.1 local cap in this
 --  large file, and shared with EUI_RaidFrames_BuffManager.lua.
 -------------------------------------------------------------------------------
 ns.LVL_DISPEL_OVERLAY = 7  -- Blizzard private-aura dispel gradient: below the border (+8) and name/health text (ns.LVL_TEXT) so it renders BEHIND them (like the regular dispel overlay), but above the health bar so it stays visible. Per-slot private-aura icons stay above at LVL_AURA.
+ns.LVL_RAISE  = 10   -- main border while hovered/targeted (strips at +11: above
+                     -- the base strips +9 and tie-above the threat/dispel strips
+                     -- +11 -- the raise container is created later, ties render
+                     -- later-created on top -- but strictly below the text band.
+                     -- MUST stay below ns.LVL_TEXT: the main border's strips are
+                     -- created lazily in UpdateBorder, AFTER the text carriers,
+                     -- so a level tie with text would put the border on top)
+ns.LVL_TEXT   = 12   -- text band: name/health text, role icon, leader crown --
+                     -- above every border incl. the raise, below the aura band
 ns.LVL_AURA   = 13   -- base level for every aura icon/bar (children at +1..+5)
-ns.LVL_RAISE  = 20   -- main border while hovered/targeted (PP container at +1)
-ns.LVL_TEXT   = 21   -- name/health text (above LVL_RAISE; matches Unit Frames)
 ns.LVL_MARKER = 22   -- raid marker icon (always on top)
 
 -------------------------------------------------------------------------------
 --  Leader-icon host strata: keeps the leader/assistant icon host on the
---  button's own strata, in the above-border/below-aura band (ns.LVL_AURA - 1,
---  same as the name/health text) so the crown clears the GENERAL border while
---  auras still draw over it. The hover/target border raise (+ns.LVL_RAISE)
---  intentionally covers it. Re-applied on reload so it recovers if a container
+--  button's own strata, in the text band (ns.LVL_AURA - 1 = ns.LVL_TEXT, same
+--  as the name/health text) so the crown clears every border -- including the
+--  hover/target raise, which stays below the band -- while auras still draw
+--  over it. Re-applied on reload so it recovers if a container
 --  SetFrameStrata cascade reset it. (Previously this lowered the host onto the
 --  chat strata, which left the icon drawing BENEATH the border entirely.)
 -------------------------------------------------------------------------------
@@ -369,6 +383,25 @@ local playerFriendlySpell = FRIENDLY_SPELL_BY_CLASS[playerClassToken]
 -- Rendered as a white border matching the hover highlight style.
 local THREAT_ACTIVE = { [2] = true, [3] = true }
 
+-- Combat indicator media + class sprite coords (shared with the Unit Frames
+-- combat icon assets). Kept on `ns` to avoid the Lua 5.1 chunk local cap.
+ns._COMBAT_MEDIA = "Interface\\AddOns\\EllesmereUI\\media\\combat\\"
+ns._COMBAT_CLASS_COORDS = {
+    WARRIOR     = { 0,     0.125, 0,     0.125 },
+    MAGE        = { 0.125, 0.25,  0,     0.125 },
+    ROGUE       = { 0.25,  0.375, 0,     0.125 },
+    DRUID       = { 0.375, 0.5,   0,     0.125 },
+    EVOKER      = { 0.5,   0.625, 0,     0.125 },
+    HUNTER      = { 0,     0.125, 0.125, 0.25  },
+    SHAMAN      = { 0.125, 0.25,  0.125, 0.25  },
+    PRIEST      = { 0.25,  0.375, 0.125, 0.25  },
+    WARLOCK     = { 0.375, 0.5,   0.125, 0.25  },
+    PALADIN     = { 0,     0.125, 0.25,  0.375 },
+    DEATHKNIGHT = { 0.125, 0.25,  0.25,  0.375 },
+    MONK        = { 0.25,  0.375, 0.25,  0.375 },
+    DEMONHUNTER = { 0.375, 0.5,   0.25,  0.375 },
+}
+
 -------------------------------------------------------------------------------
 --  Default settings
 -------------------------------------------------------------------------------
@@ -439,6 +472,7 @@ local defaults = {
         powerHeight      = 4,
         powerBgDarkness  = 40,
         powerBgColor     = { r = 107/255, g = 107/255, b = 107/255 },
+        powerBgPowerColored = false,
         powerBorderStyle = "eui",      -- "eui", "divider", "border"
         powerBorderSize  = 1,
         powerBorderColor = { r = 0, g = 0, b = 0 },
@@ -573,6 +607,15 @@ local defaults = {
         leaderIconSize   = 14,
         leaderIconOffsetX  = 0,
         leaderIconOffsetY  = 0,
+        -- Combat icon: shown on members who are in combat (M+ skip awareness)
+        showCombatIndicator = false,
+        combatIndicatorStyle = "standard",   -- standard/class/combat0..5 (none handled by showCombatIndicator)
+        combatIndicatorColor = "custom",      -- custom/classcolor (standard/class styles only)
+        combatIndicatorCustomColor = { r = 1, g = 0.2, b = 0.2 },
+        combatIndicatorSize  = 16,
+        combatIndicatorPosition = "right",
+        combatIndicatorOffsetX = 0,
+        combatIndicatorOffsetY = 0,
         statusTextPosition = "center",
         statusTextOffsetX  = 0,
         statusTextOffsetY  = 0,
@@ -673,6 +716,7 @@ local defaults = {
         -- simple buff grid (all of the active spec's tracked buffs, in a grid).
         bmSimple = {
             showBuffs       = true,
+            ownOnly         = true,
             maxBuffs        = 8,
             iconsPerRow     = 4,
             position        = "topright",
@@ -834,6 +878,9 @@ function ns.RaidFrameTooltipAllowed(button)
     local s = (fd and (fd._isParty and ns._scaledPartyProxy
         or (fd._isExtra and ns._scaledExtraProxy) or ns._scaledProfile))
         or ns._scaledProfile
+    -- Holding the Blizz UI Enhanced peek modifier lifts the mode so a hidden
+    -- tip can be read on hover (e.g. mid-combat), matching the global tooltips.
+    if EllesmereUI._tooltipPeekHeld and EllesmereUI._tooltipPeekHeld() then return true end
     local ttMode = ns._ResolveTooltipMode(s)
     if ttMode == "never" then return false end
     if ttMode == "outOfCombat" and inCombat then return false end
@@ -1200,39 +1247,10 @@ ns._GetRaidSizeFrameDimensions = function(groupSize)
     local s = db.profile
     local baseW = s.frameWidth or 125
     local baseH = s.frameHeight or 60
-    local overrides = s.raidSizeOverrides
-    if not overrides or not next(overrides) then return baseW, baseH end
-
-    -- Determine which tier this group size falls into
-    local tier
-    if groupSize <= 10 then     tier = 10
-    elseif groupSize <= 15 then tier = 15
-    elseif groupSize <= 20 then tier = 20
-    elseif groupSize <= 25 then tier = 25
-    else                        tier = 30
-    end
-
-    if tier == 20 then return baseW, baseH end
-
-    -- Cascade toward 20: check exact tier, then move toward 20
-    if tier < 20 then
-        -- Below 20: check tier, then check next tier up, then 20
-        if tier == 10 then
-            if overrides[10] then return overrides[10].width, overrides[10].height end
-            if overrides[15] then return overrides[15].width, overrides[15].height end
-        elseif tier == 15 then
-            if overrides[15] then return overrides[15].width, overrides[15].height end
-        end
-    else
-        -- Above 20: check tier, then check next tier down, then 20
-        if tier == 30 then
-            if overrides[30] then return overrides[30].width, overrides[30].height end
-            if overrides[25] then return overrides[25].width, overrides[25].height end
-        elseif tier == 25 then
-            if overrides[25] then return overrides[25].width, overrides[25].height end
-        end
-    end
-
+    -- Single cascade authority (ns._RFResolveTierOverride, defined in the
+    -- growth-origin block): exact tier, then one step toward 20, then base.
+    local _, ov = ns._RFResolveTierOverride(groupSize)
+    if ov then return ov.width or baseW, ov.height or baseH end
     return baseW, baseH
 end
 
@@ -1261,7 +1279,13 @@ ns._GetEffectiveRaidSize = function()
     local count = 0
     for ri = 1, n do
         local _, _, sub = GetRaidRosterInfo(ri)
-        if sub and vg[sub] ~= false then count = count + 1 end
+        -- Fail OPEN on nil subgroup: right after joining a raid the roster
+        -- streams in and GetRaidRosterInfo returns nil for members whose
+        -- data has not arrived -- dropping them undercounted the raid (a
+        -- 35-man read as a handful and positioned on the base tier). Count
+        -- unknowns as visible; once their subgroup arrives, the next roster
+        -- pass refines the number downward.
+        if not sub or vg[sub] ~= false then count = count + 1 end
     end
     -- Degenerate guard: if every populated group is hidden the filter excludes
     -- everyone. Fall back to the raw count so we never size for a 0-man raid
@@ -3080,8 +3104,9 @@ local function StyleButton(button)
     AnchorDispelIcon()
     d.AnchorDispelIcon = AnchorDispelIcon
 
-    -- Text carrier: name + health text sit above borders and the hover/target
-    -- raise (ns.LVL_TEXT), matching Unit Frames text overlay layering.
+    -- Text carrier: name + health text sit in the text band (ns.LVL_TEXT) --
+    -- above every border including the hover/target raise, below the aura
+    -- band so debuffs/BM icons draw over them.
     local textCarrier = CreateFrame("Frame", nil, button)
     textCarrier:SetAllPoints(health)
     textCarrier:SetFrameLevel(button:GetFrameLevel() + ns.LVL_TEXT)
@@ -3193,10 +3218,9 @@ local function StyleButton(button)
     AnchorStatusText()
     d.AnchorStatusText = AnchorStatusText
 
-    -- Role icon. Carrier sits just BELOW the aura band (ns.LVL_AURA) and above
-    -- the base/threat/dispel borders (same band as the name/health text), so the
-    -- icon clears the general border while auras still draw over it. The
-    -- hover/target border raise (+ns.LVL_RAISE) intentionally covers it.
+    -- Role icon. Carrier sits in the text band (ns.LVL_AURA - 1 = ns.LVL_TEXT,
+    -- same as the name/health text): above every border including the
+    -- hover/target raise, while auras still draw over it.
     local roleCarrier = CreateFrame("Frame", nil, button)
     roleCarrier:SetAllPoints(health)
     roleCarrier:SetFrameLevel(button:GetFrameLevel() + (ns.LVL_AURA - 1))
@@ -3315,6 +3339,23 @@ local function StyleButton(button)
     end
     AnchorReadyCheck()
     d.AnchorReadyCheck = AnchorReadyCheck
+
+    -- Combat icon (on the marker carrier, above the border). Shows for members
+    -- currently affecting combat; the 9-position anchor mirrors the role icon.
+    local combatIcon = markerCarrier:CreateTexture(nil, "OVERLAY", nil, 1)
+    local ciSz = PixelSnap(s.combatIndicatorSize or 16)
+    combatIcon:SetSize(ciSz, ciSz)
+    combatIcon:Hide()
+    d.combatIcon = combatIcon
+
+    local function AnchorCombatIcon()
+        local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        combatIcon:ClearAllPoints()
+        local pos = (s.combatIndicatorPosition or "right"):upper()
+        combatIcon:SetPoint(pos, health, pos, s.combatIndicatorOffsetX or 0, s.combatIndicatorOffsetY or 0)
+    end
+    AnchorCombatIcon()
+    d.AnchorCombatIcon = AnchorCombatIcon
 
     -- Debuff icons (pre-created, anchored dynamically)
     d.debuffIcons = {}
@@ -3622,6 +3663,13 @@ local function StyleButton(button)
     -- text alignment within the bounded region.
     local function AnchorNameText()
         local s = LiveS()   -- party/extra-aware (see LiveS note above)
+        -- Text band level, re-applied on every reload; BEFORE the name-hidden
+        -- early return because health text shares this carrier. Default sits
+        -- under the aura band (ns.LVL_TEXT); the "Show Above Icons" opt-in
+        -- (name cog) lifts the carrier above the band's children (+6 clears
+        -- each aura unit's +1..+5), still below the marker carrier.
+        textCarrier:SetFrameLevel(button:GetFrameLevel()
+            + (s.nameTextAboveIcons and (ns.LVL_AURA + 6) or ns.LVL_TEXT))
         nameFS:ClearAllPoints()
         local pos = s.namePosition or "center"
         -- The Top Name Bar shows the unit name in its own band, so suppress the
@@ -3698,6 +3746,11 @@ local function StyleButton(button)
     -- the old frame layering: hover (highest) > target > normal.
     local function ApplyBorderColor()
         if not (PP and d.borderFrame) then return end
+        -- Re-called on hover/target changes long after StyleButton: resolve
+        -- LIVE (see the LiveS note above) so party overrides and profile
+        -- swaps are honored -- the captured raid `s` goes stale (same fix as
+        -- UpdatePowerBorder below).
+        local s = LiveS()
         if (s.borderSize or 1) <= 0 then return end
         local r, g, b, a
         local raised = false
@@ -3723,6 +3776,9 @@ local function StyleButton(button)
     -- frame; otherwise it sits above at +8 (unchanged from the old layering).
     local function UpdateBorder()
         if not (PP and d.borderFrame) then return end
+        -- Re-called from ReloadFrames/ReloadPartyFrames long after StyleButton:
+        -- resolve LIVE (see the LiveS note above), same fix as UpdatePowerBorder.
+        local s = LiveS()
         local bs = s.borderSize or 1
         local bc = s.borderColor or { r = 0, g = 0, b = 0 }
         local texKey = s.borderTexture or "solid"
@@ -3743,6 +3799,11 @@ local function StyleButton(button)
         -- (StyleButton tail, ReloadFrames, ReloadPartyFrames) must not draw a
         -- border over a hidden bar. UpdateButton calls this AFTER power:Show().
         if not PP or not d.powerBorderFrame or (d.power and not d.power:IsShown()) then return end
+        -- Stored on `d` and re-called long after StyleButton, so resolve the
+        -- settings source LIVE (see the LiveS note above): the captured raid
+        -- `s` never sees party_ overrides on party frames and goes stale the
+        -- moment db.profile is reassigned by a profile swap.
+        local s = LiveS()
         local style = s.powerBorderStyle or "eui"
         if style == "eui" then
             -- EUI style: 1px divider, white at 20% opacity
@@ -3809,10 +3870,14 @@ local function StyleButton(button)
         -- Tooltip" mode, and ONLY these frames -- no other unit tooltips are
         -- touched. never = no tooltip; outOfCombat = hidden in any combat;
         -- outOfBossCombat = hidden during an encounter; always = always shown.
-        local ttMode = ns._ResolveTooltipMode(s)
-        if ttMode == "never" then return end
-        if ttMode == "outOfCombat" and inCombat then return end
-        if ttMode == "outOfBossCombat" and ns._inBossCombat then return end
+        -- The peek modifier (Blizz UI Enhanced) lifts the mode while held so a
+        -- hidden tip can be read on hover, in step with the global tooltips.
+        if not (EllesmereUI._tooltipPeekHeld and EllesmereUI._tooltipPeekHeld()) then
+            local ttMode = ns._ResolveTooltipMode(s)
+            if ttMode == "never" then return end
+            if ttMode == "outOfCombat" and inCombat then return end
+            if ttMode == "outOfBossCombat" and ns._inBossCombat then return end
+        end
         local u = self:GetAttribute("unit")
         if u and UnitExists(u) then
             GameTooltip_SetDefaultAnchor(GameTooltip, self)
@@ -4042,6 +4107,56 @@ ns._UpdateLeaderIcon = function(d, s, unit)
 end
 
 -------------------------------------------------------------------------------
+--  Combat icon show/hide decision. Shows for group members who are currently
+--  affecting combat (M+ skip awareness). Driven by UpdateButton and the
+--  lightweight ns._UpdateCombatIcons updater (UNIT_FLAGS / regen transitions).
+--  Texture Show/Hide is combat-legal. (Lives on ns to respect the chunk local
+--  cap.)
+-------------------------------------------------------------------------------
+ns._UpdateCombatIcon = function(d, s, unit)
+    local icon = d.combatIcon
+    if not icon then return end
+    if not s.showCombatIndicator then icon:Hide(); return end
+    local c = UnitAffectingCombat(unit)
+    if issecretvalue(c) or not c then icon:Hide(); return end
+
+    local EllesmereUI = ns.EllesmereUI
+    local style = s.combatIndicatorStyle or "standard"
+    local MEDIA = ns._COMBAT_MEDIA
+    if style:find("^combat%d") then
+        icon:SetTexture(MEDIA .. style .. ".tga")
+        icon:SetTexCoord(0, 1, 0, 1)
+        if icon.SetDesaturated then icon:SetDesaturated(false) end
+        icon:SetVertexColor(1, 1, 1, 1)
+    else
+        local classToken = d.classToken
+        if not classToken then local _, ct = UnitClass(unit); classToken = ct end
+        if classToken and issecretvalue(classToken) then classToken = nil end
+        if style == "class" then
+            icon:SetTexture(MEDIA .. "combat-indicator-class-custom.png")
+            local coords = classToken and ns._COMBAT_CLASS_COORDS[classToken]
+            if coords then
+                icon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+            else
+                icon:SetTexCoord(0, 1, 0, 1)
+            end
+        else
+            icon:SetTexture(MEDIA .. "combat-indicator-custom.png")
+            icon:SetTexCoord(0, 1, 0, 1)
+        end
+        local colorMode = s.combatIndicatorColor or "custom"
+        if colorMode == "classcolor" then
+            local cc = (classToken and EllesmereUI.GetClassColor and EllesmereUI.GetClassColor(classToken)) or { r = 1, g = 1, b = 1 }
+            icon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+        else
+            local cc = s.combatIndicatorCustomColor or { r = 1, g = 1, b = 1 }
+            icon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+        end
+    end
+    icon:Show()
+end
+
+-------------------------------------------------------------------------------
 --  Update all visual elements for a single button
 -------------------------------------------------------------------------------
 local function UpdateButton(button)
@@ -4158,6 +4273,14 @@ local function UpdateButton(button)
             end
             local pr, pg, pb = GetPowerColor(unit)
             power:SetStatusBarColor(pr, pg, pb, 1)
+            -- Background: power-colored bg tracks this unit's power color
+            -- (opt-in; the custom color is applied statically in ReloadFrames).
+            if s.powerBgPowerColored and d.powerBg then
+                local f = EllesmereUI.GetPowerBgDarkenFactor()
+                d.powerBg:SetColorTexture(pr * f, pg * f, pb * f, (s.powerBgDarkness or 70) / 100)
+                d._pwBgTintType = pType
+                d._pwBgTintF = f
+            end
         end
     end
 
@@ -4267,6 +4390,9 @@ local function UpdateButton(button)
 
     -- Leader/assistant icon (honors the "Show In Combat" cog)
     ns._UpdateLeaderIcon(d, s, unit)
+
+    -- Combat icon (members currently in combat)
+    ns._UpdateCombatIcon(d, s, unit)
 
     -- Raid marker
     if d.raidMarker then
@@ -5881,6 +6007,65 @@ ns._UpdateLeaderIcons = function()
     for unit, btn in pairs(ns._xfUnitToButton) do updateLeader(unit, btn) end
 end
 
+-- Lightweight: only refresh combat icons on each button. Driven by UNIT_FLAGS
+-- (per-unit combat flag flips) and combat transitions. Texture Show/Hide is
+-- combat-legal, so this is safe to run from PLAYER_REGEN_DISABLED.
+ns._UpdateCombatIcons = function()
+    local function updateCombat(unit, btn)
+        local d = GetFFD(btn)
+        if not d.combatIcon then return end
+        local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+        ns._UpdateCombatIcon(d, s, unit)
+    end
+    for unit, btn in pairs(unitToButton) do updateCombat(unit, btn) end
+    for unit, btn in pairs(ns._partyUnitToButton) do updateCombat(unit, btn) end
+    for unit, btn in pairs(ns._xfUnitToButton) do updateCombat(unit, btn) end
+end
+
+-- Single-unit combat icon refresh for UNIT_FLAGS routing (raid + party).
+ns._UpdateCombatIconFor = function(unit, btn)
+    local d = GetFFD(btn)
+    if not d.combatIcon then return end
+    local s = d._isParty and ns._scaledPartyProxy or (d._isExtra and ns._scaledExtraProxy) or ns._scaledProfile
+    ns._UpdateCombatIcon(d, s, unit)
+end
+
+-- True when the combat icon is enabled anywhere (raid or effective party). Used
+-- to skip all combat-icon work while the feature is off.
+ns._CombatIconEnabled = function()
+    if not (db and db.profile) then return false end
+    if db.profile.showCombatIndicator then return true end
+    if ns._partyProxy.showCombatIndicator then return true end
+    return false
+end
+
+-- Register UNIT_FLAGS on the per-unit trackers ONLY while the combat icon is
+-- enabled (raid uses its own key; party its effective key). When the option is
+-- off, no tracker listens for UNIT_FLAGS, so the disabled feature runs no event
+-- code at all. Event (un)registration is combat-legal. Extra Frames trackers
+-- are gated separately inside XF_Apply. Called from ReloadFrames and once after
+-- the trackers are built.
+ns.UpdateCombatEventRegistration = function()
+    if not (db and db.profile) then return end
+    local raidWant  = db.profile.showCombatIndicator and true or false
+    local partyWant = ns._partyProxy.showCombatIndicator and true or false
+    for unit, tracker in pairs(unitTrackers) do
+        local want
+        if unit == "player" then
+            want = raidWant or partyWant
+        elseif unit:find("^party%d") then
+            want = partyWant
+        else
+            want = raidWant
+        end
+        if want then
+            tracker:RegisterUnitEvent("UNIT_FLAGS", unit)
+        else
+            tracker:UnregisterEvent("UNIT_FLAGS")
+        end
+    end
+end
+
 -- Lightweight: health-only update for UNIT_HEALTH / UNIT_MAXHEALTH.
 -- Skips power, name, role, leader, marker, target, threat -- those don't
 -- change on health events and are handled by their own event paths.
@@ -6967,6 +7152,11 @@ XF.Layout = function()
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
         end
+        if d.combatIcon then
+            local cciSz = PixelSnap(xs.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
+        end
         if d.debuffIcons then
             for _, icon in ipairs(d.debuffIcons) do
                 icon:SetSize(xs.debuffSize or 18, xs.debuffSize or 18)
@@ -7056,6 +7246,17 @@ XF.EnsureBuilt = function()
                     d.power:SetValue(UnitPowerPercent(unit, pType, true, CurveConstants.ScaleTo100))
                     local pr, pg, pb = GetPowerColor(unit)
                     d.power:SetStatusBarColor(pr, pg, pb, 1)
+                    -- Power-colored bg: retint only when the power type or BG
+                    -- darken changed; the stamps keep the hot path allocation-free.
+                    local s = d._isExtra and ns._scaledExtraProxy or ns._scaledProfile
+                    if s.powerBgPowerColored and d.powerBg then
+                        local f = EllesmereUI.GetPowerBgDarkenFactor()
+                        if d._pwBgTintType ~= pType or d._pwBgTintF ~= f then
+                            d.powerBg:SetColorTexture(pr * f, pg * f, pb * f, (s.powerBgDarkness or 70) / 100)
+                            d._pwBgTintType = pType
+                            d._pwBgTintF = f
+                        end
+                    end
                 end
             elseif event == "UNIT_ABSORB_AMOUNT_CHANGED" or event == "UNIT_HEAL_ABSORB_AMOUNT_CHANGED"
                 or event == "UNIT_HEAL_PREDICTION" or event == "UNIT_MAX_HEALTH_MODIFIERS_CHANGED" then
@@ -7079,6 +7280,8 @@ XF.EnsureBuilt = function()
                 end
             elseif event == "UNIT_IN_RANGE_UPDATE" then
                 ns._UpdateButtonRange(unit, b)
+            elseif event == "UNIT_FLAGS" then
+                ns._UpdateCombatIconFor(unit, b)
             elseif event == "READY_CHECK_CONFIRM" then
                 -- Plain registration; filter to this slot's unit here
                 if unit and unit == b:GetAttribute("unit") then
@@ -7147,6 +7350,10 @@ function ns.XF_Apply()
             ns._xfUnitToButton[unit] = b
             for _, ev in ipairs(XF.EVENTS) do
                 t:RegisterUnitEvent(ev, unit)
+            end
+            -- UNIT_FLAGS is opt-in: extra frames mirror the raid combat-icon toggle.
+            if db.profile.showCombatIndicator then
+                t:RegisterUnitEvent("UNIT_FLAGS", unit)
             end
             t:RegisterEvent("READY_CHECK_CONFIRM")
             t:RegisterEvent("PLAYER_FLAGS_CHANGED")
@@ -8033,6 +8240,9 @@ local RangeUpdate  -- forward declaration (defined in Range fading section below
 -------------------------------------------------------------------------------
 local function ReloadFrames()
     local s = ns._scaledProfile
+    -- Keep UNIT_FLAGS registration in lockstep with the combat-icon toggle so a
+    -- disabled option listens for nothing (runs no event code).
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
     -- Rebuild dispel-color curves so custom-color edits take effect immediately.
     if ns._RebuildDispelCurves then ns._RebuildDispelCurves() end
     -- Recalculate active tier from current group size + overrides
@@ -8041,21 +8251,9 @@ local function ReloadFrames()
     if numMembers > 0 then
         ns._activeSizeW, ns._activeSizeH = ns._GetRaidSizeFrameDimensions(numMembers)
         -- Resolve active tier override table (for per-tier growth directions)
-        local overrides = db.profile.raidSizeOverrides
-        if overrides then
-            local tier = numMembers <= 10 and 10 or numMembers <= 15 and 15 or numMembers <= 20 and 20 or numMembers <= 25 and 25 or 30
-            if tier ~= 20 then
-                if tier < 20 then
-                    ns._activeTierOverride = overrides[tier] or (tier == 10 and overrides[15]) or nil
-                else
-                    ns._activeTierOverride = overrides[tier] or (tier == 30 and overrides[25]) or nil
-                end
-            else
-                ns._activeTierOverride = nil
-            end
-        else
-            ns._activeTierOverride = nil
-        end
+        -- via the single cascade authority.
+        local _, activeTierOv = ns._RFResolveTierOverride(numMembers)
+        ns._activeTierOverride = activeTierOv
     else
         ns._activeSizeW, ns._activeSizeH = nil, nil
         ns._activeTierOverride = nil
@@ -8115,6 +8313,7 @@ local function ReloadFrames()
         end
         if d.powerBg then
             d.powerBg:SetColorTexture((s.powerBgColor or {}).r or 0, (s.powerBgColor or {}).g or 0, (s.powerBgColor or {}).b or 0, (s.powerBgDarkness or 70) / 100)
+            d._pwBgTintType = nil
         end
         if d.UpdatePowerBorder then d.UpdatePowerBorder() end
 
@@ -8174,6 +8373,13 @@ local function ReloadFrames()
             local rcSz = PixelSnap(s.readyCheckSize or 20)
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
+        end
+
+        -- Combat icon size + position
+        if d.combatIcon then
+            local cciSz = PixelSnap(s.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
         end
 
         -- Border
@@ -8319,6 +8525,11 @@ ns._ResizeButtons = function(w, h)
     ns._activeSizeW = w
     ns._activeSizeH = h
     LayoutGroups()
+    -- The container footprint may have just changed: re-derive the
+    -- growth-corner anchor so the pinned corner holds during live slider
+    -- drags, and so the unlock framework's OnSizeChanged notification can
+    -- never leave a stale centered position as the final state.
+    if ns._ApplyTierOffset then ns._ApplyTierOffset() end
 end
 
 -- Lightweight party resize: only changes button/health/power dimensions + container.
@@ -8366,6 +8577,11 @@ ns._ResizePartyButtons = function(w, h)
                 if d.raidMarker then
                     local rmSz = PixelSnap(pp.raidMarkerSize or 16)
                     d.raidMarker:SetSize(rmSz, rmSz)
+                end
+                if d.combatIcon then
+                    local cciSz = PixelSnap(pp.combatIndicatorSize or 16)
+                    d.combatIcon:SetSize(cciSz, cciSz)
+                    if d.AnchorCombatIcon then d.AnchorCombatIcon() end
                 end
                 if d.debuffIcons then
                     for _, icon in ipairs(d.debuffIcons) do
@@ -8444,8 +8660,10 @@ ns._RFFootprint = function(bw, bh, unitGrowth, groupGrowth, cs, gs)
 end
 
 -- TOPLEFT of the BASE (20-man) footprint at the saved unlock position: the
--- shared growth origin for every size tier and the previews. Returns nil
--- when no position has been saved yet.
+-- shared growth origin for every size tier and the previews. Also returns
+-- the base footprint's width/height so corner math never recomputes it
+-- (extra return values -- existing two-value callers are unaffected).
+-- Returns nil when no position has been saved yet.
 ns._RFBaseTopLeft = function()
     local s = db.profile
     local pos = s.unlockPos
@@ -8454,46 +8672,195 @@ ns._RFBaseTopLeft = function()
     local gs = PixelSnap(s.groupSpacing or 8)
     local w, h = ns._RFFootprint(s.frameWidth or 72, s.frameHeight or 46,
         s.unitGrowth or "DOWN", s.groupGrowth or "RIGHT", cs, gs)
-    return ns._RFPosTopLeft(pos, w, h)
+    local l, t = ns._RFPosTopLeft(pos, w, h)
+    return l, t, w, h
 end
 
--- One-time conversion (the marker travels INSIDE raidSizeOverrides, so
+-- Pinned screen corner implied by a growth pair. Frames grow AWAY from this
+-- corner, so it is the corner that stays fixed when a tier's footprint
+-- differs from the base: the horizontal side comes from whichever growth is
+-- horizontal (RIGHT grows rightward, so the LEFT edge pins; LEFT pins the
+-- RIGHT edge) and the vertical side from whichever is vertical (DOWN pins
+-- TOP; UP pins BOTTOM). Growths are perpendicular (the options UI enforces
+-- it); degenerate imported data still resolves deterministically (any UP
+-- wins BOTTOM, any LEFT wins RIGHT, defaults TOP + LEFT). Merged-groups
+-- mode fills from the same corner (same two growth keys), no special case.
+ns._RFGrowthCorner = function(unitGrowth, groupGrowth)
+    local h = (unitGrowth == "LEFT" or groupGrowth == "LEFT") and "RIGHT" or "LEFT"
+    local v = (unitGrowth == "UP" or groupGrowth == "UP") and "BOTTOM" or "TOP"
+    return v .. h
+end
+
+-- Signed corner terms: how far a tier footprint's TOPLEFT shifts from the
+-- base footprint's TOPLEFT so the growth-derived corner stays pinned. THE
+-- single copy of the corner arithmetic -- the forward origin
+-- (_RFTierTopLeft), the one-time offset rebase (conversion #2 in
+-- _NormalizeTierOffsetAnchors) and the mover save-path inverse
+-- (_RFRebaseSavedCenter) all read these two values. Both terms are zero
+-- when the footprints match, so the base tier is exact by arithmetic.
+ns._RFCornerTerms = function(tw, th, bw, bh, unitGrowth, groupGrowth)
+    local corner = ns._RFGrowthCorner(unitGrowth, groupGrowth)
+    local kx = (corner:find("RIGHT") and (bw - tw)) or 0
+    local ky = (corner:find("BOTTOM") and -(bh - th)) or 0
+    return kx, ky
+end
+
+-- THE centralized growth-corner origin. Returns the TOPLEFT (UIParent
+-- bottom-left space) for a tier footprint of size (tw, th) whose
+-- growth-derived corner is pinned at the BASE footprint's same corner,
+-- plus the tier's saved offsets. Every consumer (live _ApplyTierOffset and
+-- the size previews) anchors through this one function, so the previews
+-- land exactly where the live frames land. For the base footprint with
+-- zero offsets every corner term cancels and this returns the plain base
+-- top-left -- profiles without raidSizeOverrides behave identically.
+-- Returns nil when no unlock position has been saved yet.
+ns._RFTierTopLeft = function(tw, th, unitGrowth, groupGrowth, ox, oy)
+    local bl, bt, bw, bh = ns._RFBaseTopLeft()
+    if not bl then return nil end
+    local kx, ky = ns._RFCornerTerms(tw, th, bw, bh, unitGrowth, groupGrowth)
+    return bl + (ox or 0) + kx, bt + (oy or 0) + ky
+end
+
+-- Resolve the active size tier bucket and its override table, cascading
+-- toward 20 (10 falls back to 15, 30 falls back to 25). The single copy of
+-- the cascade -- _GetRaidSizeFrameDimensions, ReloadFrames and
+-- _ApplyTierOffset all route through here. Returns tier, override; the
+-- override is nil for the base 20 tier or when none is defined.
+ns._RFResolveTierOverride = function(numMembers)
+    local overrides = db.profile.raidSizeOverrides
+    if not overrides or not numMembers or numMembers <= 0 then return 20, nil end
+    local tier
+    if numMembers <= 10 then     tier = 10
+    elseif numMembers <= 15 then tier = 15
+    elseif numMembers <= 20 then tier = 20
+    elseif numMembers <= 25 then tier = 25
+    else                         tier = 30
+    end
+    if tier == 20 then return 20, nil end
+    local ov
+    if tier < 20 then
+        ov = overrides[tier] or (tier == 10 and overrides[15]) or nil
+    else
+        ov = overrides[tier] or (tier == 30 and overrides[25]) or nil
+    end
+    return tier, ov or nil
+end
+
+-- Inverse of the corner scheme, for the unlock mover SAVE path only. The
+-- framework measures a dragged container's CENTER from its LIVE bounds --
+-- i.e. on the ACTIVE tier's footprint -- but every apply interprets
+-- unlockPos as the BASE footprint's center. Convert a live-measured center
+-- to its base-footprint equivalent so the next _ApplyTierOffset reproduces
+-- the drop position (within one physical pixel of snapping). With the base
+-- tier active, or no overrides defined, every term cancels and the center
+-- passes through unchanged -- zero behavior change for base saves.
+ns._RFRebaseSavedCenter = function(cx, cy)
+    local s = db.profile
+    local _, ov = ns._RFResolveTierOverride(ns._GetEffectiveRaidSize())
+    if not ov then return cx, cy end
+    local cs = PixelSnap(s.cellSpacing or 2)
+    local gs = PixelSnap(s.groupSpacing or 8)
+    local bw, bh = ns._RFFootprint(s.frameWidth or 72, s.frameHeight or 46,
+        s.unitGrowth or "DOWN", s.groupGrowth or "RIGHT", cs, gs)
+    local ug = ov.unitGrowth or s.unitGrowth or "DOWN"
+    local gg = ov.groupGrowth or s.groupGrowth or "RIGHT"
+    local tw, th = ns._RFFootprint(ov.width or s.frameWidth or 72,
+        ov.height or s.frameHeight or 46, ug, gg, cs, gs)
+    local kx, ky = ns._RFCornerTerms(tw, th, bw, bh, ug, gg)
+    return cx - (ov.offsetX or 0) - kx - (tw - bw) / 2,
+        cy - (ov.offsetY or 0) - ky - (bh - th) / 2
+end
+
+-- Owned creation point for raidSizeOverrides: fresh tables are ALREADY in
+-- the current offset scheme, so both one-time conversion markers are
+-- stamped at birth -- otherwise the next _NormalizeTierOffsetAnchors pass
+-- would "convert" (and silently shift) offsets that were never old-scheme.
+ns._EnsureRaidSizeOverrides = function()
+    local s = db.profile
+    if not s.raidSizeOverrides then
+        s.raidSizeOverrides = { _topLeftAnchored = true, _cornerAnchored = true }
+    else
+        -- Existing table: run any pending conversion now so edits that
+        -- follow operate on post-conversion values.
+        ns._NormalizeTierOffsetAnchors()
+    end
+    return s.raidSizeOverrides
+end
+
+-- One-time conversions (the markers travel INSIDE raidSizeOverrides, so
 -- imported/swapped profiles self-convert -- no migration-flag inheritance
--- trap): tier offsets saved under the old "re-anchor the container at
--- unlockPos.point" scheme are rebased to the top-left growth-origin scheme,
--- preserving each tier's CURRENT on-screen position exactly.
+-- trap). Each conversion applies at most once, in order, and rebases
+-- offsets against the PREVIOUS scheme's post-conversion values, preserving
+-- every tier's CURRENT on-screen position (within one physical pixel of
+-- rounding).
+--   #1 (_topLeftAnchored, June 2026): offsets saved under the old
+--      "re-anchor the container at unlockPos.point" scheme -> offsets
+--      relative to the base footprint's TOPLEFT.
+--   #2 (_cornerAnchored, July 2026): TOPLEFT-relative offsets -> offsets
+--      relative to the growth-derived pinned corner (ns._RFGrowthCorner).
+--      Only tiers whose effective growth pins RIGHT and/or BOTTOM change;
+--      DOWN+RIGHT tiers keep identical offsets.
 ns._NormalizeTierOffsetAnchors = function()
     local s = db and db.profile
     if not s then return end
     local ov = s.raidSizeOverrides
-    if not ov or ov._topLeftAnchored then return end
-    ov._topLeftAnchored = true
-    local pos = s.unlockPos
-    if not pos then return end
+    if not ov then return end
+    if ov._topLeftAnchored and ov._cornerAnchored then return end
     local cs = PixelSnap(s.cellSpacing or 2)
     local gs = PixelSnap(s.groupSpacing or 8)
-    local bl, bt = ns._RFBaseTopLeft()
-    if not bl then return end
-    for _, o in pairs(ov) do
-        if type(o) == "table" then
-            local tw, th = ns._RFFootprint(
-                o.width or s.frameWidth or 72, o.height or s.frameHeight or 46,
-                o.unitGrowth or s.unitGrowth or "DOWN",
-                o.groupGrowth or s.groupGrowth or "RIGHT", cs, gs)
-            local tl, tt = ns._RFPosTopLeft(pos, tw, th)
-            o.offsetX = math.floor((o.offsetX or 0) + (tl - bl) + 0.5)
-            o.offsetY = math.floor((o.offsetY or 0) + (tt - bt) + 0.5)
+    local pos = s.unlockPos
+    local bl, bt, bw, bh = ns._RFBaseTopLeft()
+    if not ov._topLeftAnchored then
+        ov._topLeftAnchored = true
+        if pos and bl then
+            for _, o in pairs(ov) do
+                if type(o) == "table" then
+                    local tw, th = ns._RFFootprint(
+                        o.width or s.frameWidth or 72, o.height or s.frameHeight or 46,
+                        o.unitGrowth or s.unitGrowth or "DOWN",
+                        o.groupGrowth or s.groupGrowth or "RIGHT", cs, gs)
+                    local tl, tt = ns._RFPosTopLeft(pos, tw, th)
+                    o.offsetX = math.floor((o.offsetX or 0) + (tl - bl) + 0.5)
+                    o.offsetY = math.floor((o.offsetY or 0) + (tt - bt) + 0.5)
+                end
+            end
+        end
+    end
+    if not ov._cornerAnchored then
+        ov._cornerAnchored = true
+        if pos and bl then
+            for _, o in pairs(ov) do
+                if type(o) == "table" then
+                    local ug = o.unitGrowth or s.unitGrowth or "DOWN"
+                    local gg = o.groupGrowth or s.groupGrowth or "RIGHT"
+                    local tw, th = ns._RFFootprint(
+                        o.width or s.frameWidth or 72, o.height or s.frameHeight or 46,
+                        ug, gg, cs, gs)
+                    local kx, ky = ns._RFCornerTerms(tw, th, bw, bh, ug, gg)
+                    if kx ~= 0 then
+                        o.offsetX = math.floor((o.offsetX or 0) - kx + 0.5)
+                    end
+                    if ky ~= 0 then
+                        o.offsetY = math.floor((o.offsetY or 0) - ky + 0.5)
+                    end
+                end
+            end
         end
     end
 end
 
--- Apply tier-based position offset to the container frame.
--- The container's TOPLEFT anchors at the BASE (20-man) footprint's top-left
--- plus the tier offset, so every size tier grows down/right from the same
--- origin as the base layout -- matching how the base width/height sliders
--- behave -- instead of re-centering on the saved anchor point. unlockPos
--- itself is untouched (only the growth-origin derivation changed; old saved
--- tier offsets were rebased once by _NormalizeTierOffsetAnchors).
+-- Apply tier-based position to the container frame.
+-- The active tier's 4-group footprint pins its growth-derived corner
+-- (ns._RFGrowthCorner, from the tier's EFFECTIVE unit + group growth) at
+-- the BASE (20-man) footprint's same corner, plus the tier's saved
+-- offsets, via the shared ns._RFTierTopLeft origin. A tier whose frames
+-- are larger or smaller than the base therefore grows/shrinks AWAY from
+-- the pinned corner: group growth RIGHT + unit growth DOWN pins the
+-- top-left, LEFT + UP pins the bottom-right, and so on. unlockPos itself
+-- is untouched (only the origin derivation changed; saved tier offsets
+-- were rebased once per scheme by _NormalizeTierOffsetAnchors). For the
+-- base tier or no overrides every corner term cancels, reproducing the
+-- plain base top-left -- identical behavior for no-override profiles.
 ns._ApplyTierOffset = function()
     if not containerFrame or InCombatLockdown() then return end
     -- Element-anchored container: the unlock anchor system owns the position
@@ -8502,40 +8869,21 @@ ns._ApplyTierOffset = function()
     -- anchor's edge-to-edge offsets keep the near edge flush across tier
     -- size changes; per-tier offsets do not apply while anchored.
     if EllesmereUI.IsUnlockAnchored and EllesmereUI.IsUnlockAnchored("RF_RaidFrames") then return end
-    local pos = db.profile.unlockPos
-    if not pos then return end
-    local ox, oy = 0, 0
-    local numMembers = ns._GetEffectiveRaidSize()
-    if numMembers > 0 then
-        local s = db.profile
-        local overrides = s.raidSizeOverrides
-        if overrides then
-            local tier
-            if numMembers <= 10 then     tier = 10
-            elseif numMembers <= 15 then tier = 15
-            elseif numMembers <= 20 then tier = 20
-            elseif numMembers <= 25 then tier = 25
-            else                         tier = 30
-            end
-            if tier ~= 20 then
-                -- Cascade toward 20 (same logic as _GetRaidSizeFrameDimensions)
-                local ov
-                if tier < 20 then
-                    ov = overrides[tier] or (tier == 10 and overrides[15]) or nil
-                else
-                    ov = overrides[tier] or (tier == 30 and overrides[25]) or nil
-                end
-                if ov then
-                    ox = ov.offsetX or 0
-                    oy = ov.offsetY or 0
-                end
-            end
-        end
-    end
-    local bl, bt = ns._RFBaseTopLeft()
-    if not bl then return end
+    local s = db.profile
+    if not s.unlockPos then return end
+    local _, ov = ns._RFResolveTierOverride(ns._GetEffectiveRaidSize())
+    local cs = PixelSnap(s.cellSpacing or 2)
+    local gs = PixelSnap(s.groupSpacing or 8)
+    local fw = (ov and ov.width) or s.frameWidth or 72
+    local fh = (ov and ov.height) or s.frameHeight or 46
+    local ug = (ov and ov.unitGrowth) or s.unitGrowth or "DOWN"
+    local gg = (ov and ov.groupGrowth) or s.groupGrowth or "RIGHT"
+    local tw, th = ns._RFFootprint(fw, fh, ug, gg, cs, gs)
+    local x, y = ns._RFTierTopLeft(tw, th, ug, gg,
+        (ov and ov.offsetX) or 0, (ov and ov.offsetY) or 0)
+    if not x then return end
     containerFrame:ClearAllPoints()
-    containerFrame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", PixelSnap(bl + ox), PixelSnap(bt + oy))
+    containerFrame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", PixelSnap(x), PixelSnap(y))
 end
 
 -- TEMP DEBUG (read-only, prints only): diagnose the vertical-group-growth
@@ -8568,6 +8916,69 @@ function EllesmereUI._RF_DumpLayout()
             if b1 then print(("     u1=%s LT=(%s,%s)"):format(tostring(b1:GetAttribute("unit")), r(b1:GetLeft()), r(b1:GetTop()))) end
             if b2 then print(("     u2 LT=(%s,%s)"):format(r(b2:GetLeft()), r(b2:GetTop()))) end
         end
+    end
+end
+
+-- TEMP DEBUG: diagnose per-tier offset application.
+-- /run EllesmereUI._RF_DumpOffset()
+function EllesmereUI._RF_DumpOffset()
+    local s = db.profile
+    local r = function(v) if v then return floor(v + 0.5) else return "nil" end end
+    print("|cff66ccffEUI RF Offset Dump|r")
+    print(("  unlockPos: %s"):format(s.unlockPos and ("%s/%s x=%s y=%s"):format(
+        s.unlockPos.point, s.unlockPos.relPoint, r(s.unlockPos.x), r(s.unlockPos.y)) or "|cffff6666nil|r"))
+    local eff = ns._GetEffectiveRaidSize()
+    local tier, ov = ns._RFResolveTierOverride(eff)
+    print(("  effectiveSize=%s  resolvedTier=%s  hasOverride=%s"):format(
+        tostring(eff), tostring(tier), ov and "yes" or "no"))
+    if ov then
+        print(("  override: w=%s h=%s offsetX=%s offsetY=%s ug=%s gg=%s"):format(
+            tostring(ov.width), tostring(ov.height), tostring(ov.offsetX), tostring(ov.offsetY),
+            tostring(ov.unitGrowth), tostring(ov.groupGrowth)))
+    end
+    print(("  _activeSizeW=%s _activeSizeH=%s _activeTierOv=%s"):format(
+        tostring(ns._activeSizeW), tostring(ns._activeSizeH),
+        ns._activeTierOverride and "yes" or "no"))
+    local bl, bt, bw, bh = ns._RFBaseTopLeft()
+    print(("  baseTL: l=%s t=%s bw=%s bh=%s"):format(r(bl), r(bt), r(bw), r(bh)))
+    if ov then
+        local cs = PixelSnap(s.cellSpacing or 2)
+        local gs = PixelSnap(s.groupSpacing or 8)
+        local fw = ov.width or s.frameWidth or 72
+        local fh = ov.height or s.frameHeight or 46
+        local ug = ov.unitGrowth or s.unitGrowth or "DOWN"
+        local gg = ov.groupGrowth or s.groupGrowth or "RIGHT"
+        local tw, th = ns._RFFootprint(fw, fh, ug, gg, cs, gs)
+        local kx, ky = ns._RFCornerTerms(tw, th, bw or 0, bh or 0, ug, gg)
+        local x, y = ns._RFTierTopLeft(tw, th, ug, gg, ov.offsetX or 0, ov.offsetY or 0)
+        print(("  tierFootprint: tw=%s th=%s  corner=%s kx=%s ky=%s"):format(
+            r(tw), r(th), ns._RFGrowthCorner(ug, gg), r(kx), r(ky)))
+        print(("  computed TL: x=%s y=%s"):format(r(x), r(y)))
+    end
+    if containerFrame then
+        print(("  container actual: L=%s T=%s W=%s H=%s"):format(
+            r(containerFrame:GetLeft()), r(containerFrame:GetTop()),
+            r(containerFrame:GetWidth()), r(containerFrame:GetHeight())))
+        local anchored = EllesmereUI.IsUnlockAnchored
+            and EllesmereUI.IsUnlockAnchored("RF_RaidFrames")
+        print(("  isAnchored=%s"):format(anchored and "yes" or "no"))
+    end
+    local ovs = s.raidSizeOverrides
+    if ovs then
+        local tiers = {}
+        for k, v in pairs(ovs) do
+            if type(v) == "table" then tiers[#tiers + 1] = k end
+        end
+        table.sort(tiers)
+        for _, t in ipairs(tiers) do
+            local o = ovs[t]
+            print(("  tier[%d]: w=%s h=%s ox=%s oy=%s ug=%s gg=%s"):format(
+                t, tostring(o.width), tostring(o.height),
+                tostring(o.offsetX), tostring(o.offsetY),
+                tostring(o.unitGrowth), tostring(o.groupGrowth)))
+        end
+    else
+        print("  raidSizeOverrides: nil")
     end
 end
 
@@ -8980,11 +9391,13 @@ local function OnEvent(self, event, arg1, ...)
         -- Combat starting: hide role/leader icons on frames using the in-combat cogs.
         if ns._UpdateRoleIcons then ns._UpdateRoleIcons() end
         if ns._UpdateLeaderIcons then ns._UpdateLeaderIcons() end
+        if ns._CombatIconEnabled() and ns._UpdateCombatIcons then ns._UpdateCombatIcons() end
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
         -- Combat ended: restore any role/leader icons suppressed during combat.
         if ns._UpdateRoleIcons then ns._UpdateRoleIcons() end
         if ns._UpdateLeaderIcons then ns._UpdateLeaderIcons() end
+        if ns._CombatIconEnabled() and ns._UpdateCombatIcons then ns._UpdateCombatIcons() end
         -- Complete any container reparent that was blocked during combat (e.g.
         -- the options panel was closed mid-combat while a preview was active).
         -- Without this, a combat auto-close can leave the real frames orphaned
@@ -9013,6 +9426,9 @@ local function OnEvent(self, event, arg1, ...)
                 else
                     t0 = ns.ProfBegin("LayoutGroups:REGEN"); LayoutGroups(); ns.ProfEnd("LayoutGroups:REGEN", t0)
                 end
+                -- Same-dimension tier changes take the LayoutGroups branch;
+                -- reapply offset so the container lands at the correct tier.
+                if ns._ApplyTierOffset then ns._ApplyTierOffset() end
             end
             if ns._partyFramesVisible then
                 ns._LayoutPartyFrames()
@@ -9047,6 +9463,10 @@ local function OnEvent(self, event, arg1, ...)
             if numMembers > 0 then
                 local newW, newH = ns._GetRaidSizeFrameDimensions(numMembers)
                 if newW ~= ns._activeSizeW or newH ~= ns._activeSizeH then
+                    ns._sizeTierDirtyInCombat = true
+                end
+                local newTier, newOv = ns._RFResolveTierOverride(numMembers)
+                if newOv ~= ns._activeTierOverride then
                     ns._sizeTierDirtyInCombat = true
                 end
             end
@@ -9153,6 +9573,15 @@ local function OnEvent(self, event, arg1, ...)
                     end
                     t0 = ns.ProfBegin("LayoutGroups:ROSTER"); LayoutGroups(); ns.ProfEnd("LayoutGroups:ROSTER", t0)
                 end
+                -- Re-derive the growth-corner anchor after any roster-driven
+                -- layout. tierChanged above compares frame DIMENSIONS, so two
+                -- tiers sharing a size (fresh tiers copy the base 20-man size)
+                -- take the bare-LayoutGroups branches even when their offsets
+                -- or growth differ -- without this, a roster that refined from
+                -- an early undercount (streaming subgroup data at join) left
+                -- the container stuck on the small-tier position until the
+                -- next full reload. Cheap, idempotent, self-gates on combat.
+                if ns._ApplyTierOffset then ns._ApplyTierOffset() end
             end
             if ns._partyFramesVisible then
                 ns._LayoutPartyFrames()
@@ -9189,6 +9618,17 @@ local function OnEvent(self, event, arg1, ...)
             d.power:SetValue(UnitPowerPercent(arg1, pType, true, CurveConstants.ScaleTo100))
             local pr, pg, pb = GetPowerColor(arg1)
             d.power:SetStatusBarColor(pr, pg, pb, 1)
+            -- Power-colored bg: retint only when the power type or BG darken
+            -- changed; the stamps keep the hot path allocation-free.
+            local s = d._isParty and ns._scaledPartyProxy or ns._scaledProfile
+            if s.powerBgPowerColored and d.powerBg then
+                local f = EllesmereUI.GetPowerBgDarkenFactor()
+                if d._pwBgTintType ~= pType or d._pwBgTintF ~= f then
+                    d.powerBg:SetColorTexture(pr * f, pg * f, pb * f, (s.powerBgDarkness or 70) / 100)
+                    d._pwBgTintType = pType
+                    d._pwBgTintF = f
+                end
+            end
             ns.ProfEnd("PowerUpdate", t0)
         end
     elseif event == "UNIT_AURA" then
@@ -9282,6 +9722,9 @@ local function OnEvent(self, event, arg1, ...)
             end
             ns.ProfEnd("ThreatUpdate", t0)
         end
+    elseif event == "UNIT_FLAGS" then
+        local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
+        if btn then ns._UpdateCombatIconFor(arg1, btn) end
     elseif event == "PLAYER_FLAGS_CHANGED" or event == "UNIT_CONNECTION" then
         local btn = unitToButton[arg1] or ns._partyUnitToButton[arg1]
         if btn then
@@ -9496,7 +9939,7 @@ do
             "maxHealthStyle", "maxHealthOpacity", "maxHealthColor", "maxHealthBgOpacity",
         },
         powerBar = {
-            "showPowerBar", "powerHeight", "powerBgDarkness", "powerBgColor",
+            "showPowerBar", "powerHeight", "powerBgDarkness", "powerBgColor", "powerBgPowerColored",
             "powerBorderStyle", "powerBorderSize", "powerBorderColor", "powerBorderAlpha",
             "powerShowForHealer", "powerShowForTank", "powerShowForDPS", "smoothPowerBars",
         },
@@ -9516,6 +9959,8 @@ do
             "readyCheckSize", "readyCheckPosition", "readyCheckOffsetX", "readyCheckOffsetY",
             "statusTextPosition", "statusTextOffsetX", "statusTextOffsetY", "statusTextSize", "statusTextColor",
             "showLeaderIcon", "showLeaderIconInCombat", "leaderIconPosition", "leaderIconSize", "leaderIconOffsetX", "leaderIconOffsetY",
+            "showCombatIndicator", "combatIndicatorStyle", "combatIndicatorColor", "combatIndicatorCustomColor",
+            "combatIndicatorSize", "combatIndicatorPosition", "combatIndicatorOffsetX", "combatIndicatorOffsetY",
             "borderSize", "borderColor", "borderAlpha", "borderTexture",
             "borderBehind", "borderTextureOffset", "borderTextureOffsetY",
             "borderTextureShiftX", "borderTextureShiftY",
@@ -9627,7 +10072,7 @@ for _, k in ipairs({
     "nameSize", "healthTextSize", "healAbsorbTextSize", "statusTextSize",
     "debuffStacksTextSize", "debuffDurTextSize", "defDurTextSize",
     -- Icon sizes
-    "roleIconSize", "leaderIconSize", "raidMarkerSize",
+    "roleIconSize", "leaderIconSize", "raidMarkerSize", "combatIndicatorSize",
     "debuffSize", "defSize", "paSize", "dispellableDebuffSize",
     -- Offsets
     "nameOffsetX", "nameOffsetY",
@@ -9637,6 +10082,7 @@ for _, k in ipairs({
     "roleIconOffsetX", "roleIconOffsetY",
     "leaderIconOffsetX", "leaderIconOffsetY",
     "raidMarkerOffsetX", "raidMarkerOffsetY",
+    "combatIndicatorOffsetX", "combatIndicatorOffsetY",
     "debuffOffsetX", "debuffOffsetY",
     "dispellableDebuffOffsetX", "dispellableDebuffOffsetY",
     "debuffStacksOffsetX", "debuffStacksOffsetY",
@@ -10130,6 +10576,10 @@ end
 -- we write party_ values onto db.profile, call the closures, then restore.
 ns.ReloadPartyFrames = function()
     if not ns._partyHeader then return end
+    -- Re-evaluate UNIT_FLAGS registration before the temp-swap below (which
+    -- overwrites db.profile), so a section sync/unsync that flips the party's
+    -- effective combat-icon state turns the party trackers on/off in step.
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
     local p = ns._partyProxy  -- reads party_ keys with fallthrough
     local raw = db.profile
     -- Scaled reads for everything in INDICATOR_SCALE_KEYS (role/leader/marker
@@ -10196,6 +10646,7 @@ ns.ReloadPartyFrames = function()
         end
         if d.powerBg then
             d.powerBg:SetColorTexture((raw.powerBgColor or {}).r or 0, (raw.powerBgColor or {}).g or 0, (raw.powerBgColor or {}).b or 0, (raw.powerBgDarkness or 70) / 100)
+            d._pwBgTintType = nil
         end
         if d.UpdatePowerBorder then d.UpdatePowerBorder() end
 
@@ -10257,6 +10708,13 @@ ns.ReloadPartyFrames = function()
             local rcSz = PixelSnap(pp.readyCheckSize or 20)
             d.readyCheck:SetSize(rcSz, rcSz)
             if d.AnchorReadyCheck then d.AnchorReadyCheck() end
+        end
+
+        -- Combat icon
+        if d.combatIcon then
+            local cciSz = PixelSnap(pp.combatIndicatorSize or 16)
+            d.combatIcon:SetSize(cciSz, cciSz)
+            if d.AnchorCombatIcon then d.AnchorCombatIcon() end
         end
 
         -- Border
@@ -10361,7 +10819,21 @@ local function RegisterWithUnlockMode()
                 return containerFrame:GetWidth(), containerFrame:GetHeight()
             end,
 
-            savePos = function(_, point, relPoint, x, y)
+            savePos = function(_, point, relPoint, x, y, srcPoint, srcRelPoint)
+                -- srcPoint/srcRelPoint: the PRE-conversion anchor the unlock
+                -- framework received. Anything other than CENTER/CENTER means
+                -- the CENTER coords were measured from the container's LIVE
+                -- bounds -- the ACTIVE tier's footprint -- and must be rebased
+                -- to the BASE footprint's equivalent center (the convention
+                -- every apply reads), or a mover drag performed while a
+                -- non-base tier is active lands off by a constant offset on
+                -- the next _ApplyTierOffset pass. CENTER/CENTER or absent
+                -- (revert / nudge / typed-edit callers) means the value is
+                -- already stored-convention; rebasing again would corrupt it.
+                if srcPoint and not (srcPoint == "CENTER" and (srcRelPoint or "CENTER") == "CENTER")
+                    and ns._RFRebaseSavedCenter then
+                    x, y = ns._RFRebaseSavedCenter(x, y)
+                end
                 db.profile.unlockPos = { point = point, relPoint = relPoint, x = snap(containerFrame, x), y = snap(containerFrame, y) }
             end,
             loadPos = function()
@@ -11775,7 +12247,12 @@ local function CreatePreviewFrame(index)
     readyCheck:SetPoint("CENTER", health, "CENTER", 0, 0)
     readyCheck:Hide()
 
-    -- Text carrier: above borders and the hover/target raise (ns.LVL_TEXT).
+    -- Combat icon (position/size/style re-applied in the preview indicator pass)
+    local combatIcon = markerCarrier:CreateTexture(nil, "OVERLAY", nil, 1)
+    combatIcon:SetSize(PixelSnap(s.combatIndicatorSize or 16), PixelSnap(s.combatIndicatorSize or 16))
+    combatIcon:Hide()
+
+    -- Text carrier: text band (above every border incl. the raise, below auras).
     local textCarrier = CreateFrame("Frame", nil, f)
     textCarrier:SetAllPoints(health)
     textCarrier:SetFrameLevel(f:GetFrameLevel() + ns.LVL_TEXT)
@@ -11865,6 +12342,7 @@ local function CreatePreviewFrame(index)
     f._statusText = statusFS
     f._roleIcon = roleIcon
     f._leaderIcon = leaderIcon
+    f._combatIcon = combatIcon
 
     -- Helper: create a preview aura icon with texture, cooldown, border
     local function MakePreviewAuraIcon(parent, level, sz)
@@ -12612,7 +13090,11 @@ local function ApplyPreviewData(f, index)
         if hidePower then
             f._powerBg:Hide()
         else
-            f._powerBg:SetColorTexture((s.powerBgColor or {}).r or 0, (s.powerBgColor or {}).g or 0, (s.powerBgColor or {}).b or 0, (s.powerBgDarkness or 70) / 100)
+            local bgc = EllesmereUI.GetPowerColor and s.powerBgPowerColored
+                and EllesmereUI.GetPowerColor(ns._PV_CLASS_POWER[classToken] or "MANA")
+            local pf = bgc and EllesmereUI.GetPowerBgDarkenFactor() or 1
+            bgc = bgc or s.powerBgColor
+            f._powerBg:SetColorTexture(((bgc or {}).r or 0) * pf, ((bgc or {}).g or 0) * pf, ((bgc or {}).b or 0) * pf, (s.powerBgDarkness or 70) / 100)
             f._powerBg:Show()
         end
     end
@@ -12959,6 +13441,13 @@ local function ApplyPreviewData(f, index)
 
     -- Name (re-anchor position every refresh, single-point + width constraint)
     if f._nameText then
+        -- Text band level: mirrors AnchorNameText on the live buttons ("Show
+        -- Above Icons" lifts the carrier over the aura band).
+        local pvCarrier = f._nameText:GetParent()
+        if pvCarrier and pvCarrier.SetFrameLevel then
+            pvCarrier:SetFrameLevel(f:GetFrameLevel()
+                + (s.nameTextAboveIcons and (ns.LVL_AURA + 6) or ns.LVL_TEXT))
+        end
         f._nameText:ClearAllPoints()
         local pos = s.namePosition or "center"
         if pos == "none" or s.topNameBarEnabled then
@@ -13251,6 +13740,46 @@ local function ApplyPreviewData(f, index)
             f._leaderIcon:Show()
         else
             f._leaderIcon:Hide()
+        end
+    end
+
+    -- Combat icon: on live alive members when the indicators eyeball is on.
+    if f._combatIcon then
+        if indVis and s.showCombatIndicator and not isDead and not isOffline then
+            local cciSz = PixelSnap(s.combatIndicatorSize or 16)
+            f._combatIcon:SetSize(cciSz, cciSz)
+            f._combatIcon:ClearAllPoints()
+            local ciPos = (s.combatIndicatorPosition or "right"):upper()
+            f._combatIcon:SetPoint(ciPos, f._health, ciPos, s.combatIndicatorOffsetX or 0, s.combatIndicatorOffsetY or 0)
+            local style = s.combatIndicatorStyle or "standard"
+            local MEDIA = ns._COMBAT_MEDIA
+            if style:find("^combat%d") then
+                f._combatIcon:SetTexture(MEDIA .. style .. ".tga")
+                f._combatIcon:SetTexCoord(0, 1, 0, 1)
+                if f._combatIcon.SetDesaturated then f._combatIcon:SetDesaturated(false) end
+                f._combatIcon:SetVertexColor(1, 1, 1, 1)
+            else
+                if style == "class" then
+                    f._combatIcon:SetTexture(MEDIA .. "combat-indicator-class-custom.png")
+                    local coords = classToken and ns._COMBAT_CLASS_COORDS[classToken]
+                    if coords then f._combatIcon:SetTexCoord(coords[1], coords[2], coords[3], coords[4])
+                    else f._combatIcon:SetTexCoord(0, 1, 0, 1) end
+                else
+                    f._combatIcon:SetTexture(MEDIA .. "combat-indicator-custom.png")
+                    f._combatIcon:SetTexCoord(0, 1, 0, 1)
+                end
+                local colorMode = s.combatIndicatorColor or "custom"
+                if colorMode == "classcolor" then
+                    local cc = (classToken and EllesmereUI.GetClassColor(classToken)) or { r = 1, g = 1, b = 1 }
+                    f._combatIcon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+                else
+                    local cc = s.combatIndicatorCustomColor or { r = 1, g = 1, b = 1 }
+                    f._combatIcon:SetVertexColor(cc.r, cc.g, cc.b, 1)
+                end
+            end
+            f._combatIcon:Show()
+        else
+            f._combatIcon:Hide()
         end
     end
 
@@ -13736,6 +14265,10 @@ local function HidePreview(skipRestore)
     -- Re-run layout out of combat in case frame sizes changed while previewing
     -- (LayoutGroups SetPoints secure headers, so out of combat only).
     if not InCombatLockdown() then LayoutGroups() end
+    -- Re-derive the growth-corner anchor after the relayout (self-gates on
+    -- combat) so a size change made while previewing can never strand the
+    -- container at a stale position.
+    if ns._ApplyTierOffset then ns._ApplyTierOffset() end
     UpdateVisibility()
     if ns._UpdatePartyVisibility then ns._UpdatePartyVisibility() end
 end
@@ -13793,7 +14326,9 @@ end
 -------------------------------------------------------------------------------
 --  Size preview (simple: just health + power bars at the tier's dimensions)
 --  Shows the correct number of frames for the tier (10/15/25/30).
---  Respects "real" vs "overlay" preview mode. No indicators, no randomization.
+--  Always screen-anchored exactly where the live frames land (shared
+--  growth-corner origin ns._RFTierTopLeft), regardless of preview mode.
+--  No indicators, no randomization.
 -------------------------------------------------------------------------------
 ns._sizePreviewTier = nil
 ns._sizePreviewFrames = {}
@@ -13872,23 +14407,27 @@ ns._ShowSizePreview = function(tier)
         if py > maxUY then maxUY = py end
     end
 
-    -- Total bounding box (always 4 groups, matching real LayoutGroups container)
+    -- Total bounding box: the 4-group mover footprint via the SAME
+    -- ns._RFFootprint the live container sizing and the corner origin use
+    -- (one formula, so preview and live can never drift). MOVER_GROUPS
+    -- stays 4 for the group normalization below -- it must keep matching
+    -- the real LayoutGroups container, which also normalizes over 4.
     local MOVER_GROUPS = 4
-    local totalW = math.abs(stepX) > 0 and (MOVER_GROUPS * groupW + (MOVER_GROUPS - 1) * gs) or groupW
-    local totalH = math.abs(stepY) > 0 and (MOVER_GROUPS * groupH + (MOVER_GROUPS - 1) * gs) or groupH
+    local totalW, totalH = ns._RFFootprint(bw, bh, unitGrowth, groupGrowth, cs, gs)
 
     -- Tier offset
     local tierOX = ov.offsetX or 0
     local tierOY = ov.offsetY or 0
 
     -- Create or reuse container
-    local mode = s.previewMode or "overlay"
     local container = ns._sizePreviewContainer
     if not container then
         container = CreateFrame("Frame", nil, UIParent)
         container:SetFrameStrata("FULLSCREEN_DIALOG")
         container:SetFrameLevel(10)
-        container:SetClampedToScreen(true)
+        -- Never clamp: the preview must land exactly where the live
+        -- container lands, including partially off-screen positions.
+        container:SetClampedToScreen(false)
         ns._sizePreviewContainer = container
     end
 
@@ -13898,12 +14437,13 @@ ns._ShowSizePreview = function(tier)
     if container._bg then container._bg:Hide() end
     container:SetFrameStrata("HIGH")
     container:ClearAllPoints()
-    -- Same growth origin as the real container (_ApplyTierOffset): tiers
-    -- grow down/right from the base footprint's top-left + tier offset.
-    local bl, bt = ns._RFBaseTopLeft()
-    if bl then
-        container:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT",
-            PixelSnap(bl + tierOX), PixelSnap(bt + tierOY))
+    -- Same growth-corner origin as the live container (_ApplyTierOffset):
+    -- the tier footprint's growth-derived corner pins at the base
+    -- footprint's same corner plus the tier offset, via the shared
+    -- ns._RFTierTopLeft -- the preview lands exactly where live lands.
+    local px, py = ns._RFTierTopLeft(totalW, totalH, unitGrowth, groupGrowth, tierOX, tierOY)
+    if px then
+        container:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", PixelSnap(px), PixelSnap(py))
     else
         container:SetPoint("CENTER", UIParent, "CENTER", tierOX, tierOY)
     end
@@ -14554,7 +15094,10 @@ local function HidePartyPreview(skipRestore)
     -- is a combat-legal SetAlpha(1) plus dropping the mouse blockers. See
     -- HidePreview. No combat gate, no SetParent/SetPoint, no ns._restorePending.
     ns._SetRealFramesPreviewHidden(false)
-    if not InCombatLockdown() then LayoutGroups() end
+    if not InCombatLockdown() then
+        LayoutGroups()
+        if ns._ApplyTierOffset then ns._ApplyTierOffset() end
+    end
     UpdateVisibility()
     if ns._UpdatePartyVisibility then ns._UpdatePartyVisibility() end
 end
@@ -14835,6 +15378,51 @@ function ERF:OnEnable()
         if ns.XF_Apply then ns.XF_Apply() end
     end
 
+    -- Buff Manager LAYER swap refresh (spec-override BM forks): re-derives
+    -- the spell lookup, then re-anchors + fully rescans BM indicators on
+    -- every visible raid/party button. A layer swap can change bmSimple
+    -- geometry AND the tracked spell set; a lookup rebuild alone leaves
+    -- stale icons frozen (see the PLAYER_SPECIALIZATION_CHANGED handler).
+    -- Deliberately BM-only: never calls ReloadFrames, so profile swaps
+    -- (_ERF_RefreshAll above) are not doubled. Combat-safe: BM code only
+    -- touches our own pooled child frames, never the secure buttons.
+    -- noPage: skip the options-page repaint when the caller IS a page build.
+    _G._ERF_BMRefresh = function(noPage)
+        if not ns.db then return end
+        if ns.BM_RebuildLookup then ns.BM_RebuildLookup(ns.db) end
+        local function refreshButtons(list)
+            for _, btn in ipairs(list) do
+                local u = btn:GetAttribute("unit")
+                if u and btn:IsVisible() then
+                    -- Per-button state lives in the FFD side table, never on
+                    -- the button frame itself; BM_AnchorIndicators takes the
+                    -- FFD table (BM_UpdateIndicators takes the button).
+                    local d = GetFFD(btn)
+                    if d.bmIconPool and d.health and ns.BM_AnchorIndicators then
+                        local s = d._isParty and ns._scaledPartyProxy
+                            or (d._isExtra and ns._scaledExtraProxy)
+                            or ns._scaledProfile
+                        if s then ns.BM_AnchorIndicators(d, d.health, s) end
+                    end
+                    if ns.BM_UpdateIndicators then ns.BM_UpdateIndicators(btn, u, ns.db) end
+                end
+            end
+        end
+        if framesVisible then refreshButtons(allButtons) end
+        if ns._partyFramesVisible and ns._partyAllButtons then
+            refreshButtons(ns._partyAllButtons)
+        end
+        local pv = ns._bmPreviewFrame
+        if pv and pv._health and ns.BM_ApplyPreviewIndicators then
+            ns.BM_ApplyPreviewIndicators(pv, 1, ns.db.profile)
+        end
+        -- Open BM options page: force a rebuild so its widgets re-bind to
+        -- the (identity-preserved, content-swapped) profile tables.
+        if not noPage and ns._bmRoot and EllesmereUI and EllesmereUI.RefreshPage then
+            EllesmereUI:RefreshPage(true)
+        end
+    end
+
 
     -- Expose EUI party frames to external trackers that support a provider
     -- API (e.g. MiniCC). No-op when none is installed.
@@ -14885,6 +15473,9 @@ function ERF:OnEnable()
     for i = 1, 40 do MakeUnitTracker("raid" .. i) end
     eventFrame:SetScript("OnEvent", OnEvent)
 
+    -- UNIT_FLAGS is opt-in: only registered while the combat icon is enabled.
+    if ns.UpdateCombatEventRegistration then ns.UpdateCombatEventRegistration() end
+
     -- Dynamically register/unregister UNIT_POWER_UPDATE per unit based on
     -- role and power display settings. Called after roster changes and
     -- when the user changes power bar role filters.
@@ -14916,6 +15507,10 @@ function ERF:OnEnable()
         if framesVisible then
             RebuildUnitMap()
             LayoutGroups()
+            -- Re-derive the growth-corner anchor: this can be the first
+            -- sized pass when roster data arrives late, and its SetSize
+            -- must not leave the container on a stale anchor.
+            if ns._ApplyTierOffset then ns._ApplyTierOffset() end
             UpdateAllButtons()
         end
         if ns._partyFramesVisible then

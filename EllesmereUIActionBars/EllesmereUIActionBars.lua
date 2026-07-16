@@ -199,7 +199,7 @@ function EAB.VisibilityCompat.Normalize(settings)
     return EAB.VisibilityCompat.ApplyMode(settings, "always")
 end
 
-function EAB.VisibilityCompat.Copy(dst, src)
+function EAB.VisibilityCompat.Copy(dst, src, dstNoGroupModes)
     if not dst or not src then return end
 
     local mode = EAB.VisibilityCompat.Normalize(src)
@@ -211,6 +211,19 @@ function EAB.VisibilityCompat.Copy(dst, src)
     else
         dst.mouseoverAlpha = src.mouseoverAlpha
         dst._savedBarAlpha = nil
+    end
+
+    -- Multi-select set travels with the copy (after ApplyMode, so the
+    -- scalar/set pair stays consistent). Group-axis items are stripped for
+    -- targets that cannot express them (Pet Bar); the stripped selection
+    -- re-normalizes through the shared setter, which routes the scalar back
+    -- through ApplyMode to keep the legacy booleans synced.
+    if EllesmereUI and EllesmereUI.VisCopySelection then
+        EllesmereUI.VisCopySelection(dst, src, "barVisibility",
+            dstNoGroupModes and EllesmereUI.VIS_CAPS_NO_GROUP or nil,
+            EAB.VisibilityCompat.ApplyMode)
+    else
+        dst.visibilityModes = nil
     end
 end
 
@@ -682,6 +695,32 @@ local function ButtonHasAction(btn, prefix)
 end
 ns.ButtonHasAction = ButtonHasAction
 
+-- Force-paint a Blizzard-native button's cooldown swipe/text from its current
+-- action state, instead of waiting on the next ACTIONBAR_UPDATE_COOLDOWN
+-- broadcast. We kill the stock cooldown broadcasters at load, so buttons we
+-- don't rebuild (OverrideActionBarButton1-6, ExtraActionButton1) otherwise show
+-- no swipe/number for an ability already on cooldown the instant they appear,
+-- until mouseover or combat forces a refresh. Reads the slot via
+-- GetAttribute("action"), never btn.action (protected -- reading it during
+-- combat taints). Clears when no active duration is resolvable so a stale swipe
+-- from a prior state is never left behind.
+local function ForceCooldownPaint(btn)
+    if not btn then return end
+    local cd = btn.cooldown
+    local action = btn:GetAttribute("action")
+    if cd and action and HasAction(action) and C_ActionBar and C_ActionBar.GetActionCooldown then
+        local cdInfo = C_ActionBar.GetActionCooldown(action)
+        local durObj = cdInfo and cdInfo.isActive and C_ActionBar.GetActionCooldownDuration
+            and C_ActionBar.GetActionCooldownDuration(action)
+        if durObj then
+            cd:SetCooldownFromDurationObject(durObj)
+        else
+            cd:Clear()
+        end
+    end
+end
+ns.ForceCooldownPaint = ForceCooldownPaint
+
 -- Stock bar frames to disable. Each entry carries flags for how to handle it:
 --   retainEvents  = true  -> do NOT unregister events (needed for override state)
 local STOCK_BAR_DISPOSAL = {
@@ -721,6 +760,10 @@ do
     local _abefEvents = {
         "ACTIONBAR_UPDATE_COOLDOWN", "ACTIONBAR_UPDATE_STATE",
         "ACTIONBAR_UPDATE_USABLE", "ACTIONBAR_SLOT_CHANGED",
+        -- Spell-typed extra-action buttons (some delve abilities) carry no
+        -- action slot, so their cooldown fires SPELL_UPDATE_COOLDOWN, not
+        -- ACTIONBAR_UPDATE_COOLDOWN. Needed so the broadcaster repaints them.
+        "SPELL_UPDATE_COOLDOWN",
         "UPDATE_SHAPESHIFT_FORM", "PLAYER_ENTERING_WORLD",
     }
     local _aaefEvents = {
@@ -728,58 +771,70 @@ do
         "UNIT_SPELLCAST_SUCCEEDED", "UNIT_SPELLCAST_FAILED",
         "UNIT_SPELLCAST_INTERRUPTED",
     }
-    local _broadcasterActive = false
-    local vehFrame = CreateFrame("Frame")
-    vehFrame:RegisterEvent("UNIT_ENTERED_VEHICLE")
-    vehFrame:RegisterEvent("UNIT_EXITED_VEHICLE")
-    vehFrame:RegisterEvent("UPDATE_VEHICLE_ACTIONBAR")
-    vehFrame:RegisterEvent("UPDATE_OVERRIDE_ACTIONBAR")
-    vehFrame:SetScript("OnEvent", function(_, event, unit)
-        if event == "UNIT_ENTERED_VEHICLE" or event == "UPDATE_VEHICLE_ACTIONBAR"
-            or event == "UPDATE_OVERRIDE_ACTIONBAR" then
-            if unit and unit ~= "player" then return end
-            if not _broadcasterActive then
-                _broadcasterActive = true
-                if ActionBarButtonEventsFrame then
-                    for _, ev in ipairs(_abefEvents) do
-                        ActionBarButtonEventsFrame:RegisterEvent(ev)
-                    end
-                end
-                if ActionBarActionEventsFrame then
-                    for _, ev in ipairs(_aaefEvents) do
-                        ActionBarActionEventsFrame:RegisterUnitEvent(ev, "player")
-                    end
+    -- The native broadcaster is killed at load; re-enable it only while
+    -- something that needs it is active. Two independent needs, ref-counted so
+    -- one turning off never strands the other: the vehicle/override bar
+    -- (OverrideActionBarButton1-6) and the extra action button
+    -- (ExtraActionButton1 -- its spell-typed delve abilities have no action
+    -- slot, so our own dispatch can't paint their cooldown; only Blizzard's
+    -- native update, driven by this broadcaster, can).
+    local _vehNeed, _extraNeed, _broadcasterActive = false, false, false
+    local function ApplyBroadcaster()
+        local want = _vehNeed or _extraNeed
+        if want == _broadcasterActive then return end
+        _broadcasterActive = want
+        if want then
+            if ActionBarButtonEventsFrame then
+                for _, ev in ipairs(_abefEvents) do
+                    ActionBarButtonEventsFrame:RegisterEvent(ev)
                 end
             end
-            -- Refresh keybind text + full update on OverrideActionBar buttons.
-            -- The broadcaster kill at load time prevented the initial setup.
+            if ActionBarActionEventsFrame then
+                for _, ev in ipairs(_aaefEvents) do
+                    ActionBarActionEventsFrame:RegisterUnitEvent(ev, "player")
+                end
+            end
+        else
+            if ActionBarButtonEventsFrame then ActionBarButtonEventsFrame:UnregisterAllEvents() end
+            if ActionBarActionEventsFrame then ActionBarActionEventsFrame:UnregisterAllEvents() end
+        end
+    end
+    -- Recompute both needs from ground truth -- the actual visibility of the
+    -- buttons that depend on the broadcaster -- and apply. We poll visibility on
+    -- a broad set of events (below) instead of tracking enter/exit precisely,
+    -- because the triggering events proved unreliable: the extra action button's
+    -- own OnShow doesn't fire on delve entry, and the vehicle enter events don't
+    -- reliably fire/keep state either. Visibility is the ground truth.
+    local function RefreshBroadcasterNeeds()
+        _vehNeed = (OverrideActionBarButton1 and OverrideActionBarButton1:IsShown()) and true or false
+        _extraNeed = (ExtraActionButton1 and ExtraActionButton1:IsShown()) and true or false
+        ApplyBroadcaster()
+    end
+    -- Exposed for the extra action button's Show-hook refresh in
+    -- SetupBlizzardMovableFrame (a reliable trigger for delve entry).
+    ns.RefreshBroadcaster = RefreshBroadcasterNeeds
+    local barFrame = CreateFrame("Frame")
+    barFrame:RegisterEvent("UNIT_ENTERED_VEHICLE")
+    barFrame:RegisterEvent("UNIT_EXITED_VEHICLE")
+    barFrame:RegisterEvent("UPDATE_VEHICLE_ACTIONBAR")
+    barFrame:RegisterEvent("UPDATE_OVERRIDE_ACTIONBAR")
+    barFrame:RegisterEvent("UPDATE_EXTRA_ACTIONBAR")
+    barFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    barFrame:SetScript("OnEvent", function(_, event, unit)
+        -- Deferred so IsShown reflects Blizzard's post-event state.
+        C_Timer.After(0, RefreshBroadcasterNeeds)
+        -- On vehicle/override entry, force-paint the OverrideActionBar buttons'
+        -- cooldowns immediately -- the broadcaster only catches the NEXT change,
+        -- so an ability already on cooldown when the bar appears needs an
+        -- initial paint (see ForceCooldownPaint).
+        if (event == "UNIT_ENTERED_VEHICLE" or event == "UPDATE_VEHICLE_ACTIONBAR"
+            or event == "UPDATE_OVERRIDE_ACTIONBAR") and not (unit and unit ~= "player") then
             C_Timer.After(0, function()
                 for i = 1, 6 do
                     local btn = _G["OverrideActionBarButton" .. i]
                     if btn then
                         if btn.UpdateAction then btn:UpdateAction() end
-                        -- Force-paint the cooldown swipe/text right now instead of
-                        -- waiting for a future ACTIONBAR_UPDATE_COOLDOWN broadcast --
-                        -- re-registering the broadcaster above only catches the NEXT
-                        -- cooldown state change, so a vehicle ability already on
-                        -- cooldown the moment we enter (or re-enter) the vehicle never
-                        -- gets an initial paint and shows no swipe/number until
-                        -- something else (mouseover, combat) forces a real update.
-                        -- Mirrors the ExtraActionButton1 cooldown dispatch above:
-                        -- GetAttribute("action"), never btn.action (protected/secret
-                        -- attribute -- reading it directly during combat taints).
-                        local cd = btn.cooldown
-                        local action = btn:GetAttribute("action")
-                        if cd and action and HasAction(action) and C_ActionBar and C_ActionBar.GetActionCooldown then
-                            local cdInfo = C_ActionBar.GetActionCooldown(action)
-                            if cdInfo and cdInfo.isActive then
-                                local durObj = C_ActionBar.GetActionCooldownDuration
-                                    and C_ActionBar.GetActionCooldownDuration(action)
-                                if durObj then cd:SetCooldownFromDurationObject(durObj) end
-                            else
-                                cd:Clear()
-                            end
-                        end
+                        ForceCooldownPaint(btn)
                         local hk = btn.HotKey
                         if hk then
                             local key1 = GetBindingKey("ACTIONBUTTON" .. i)
@@ -791,13 +846,6 @@ do
                     end
                 end
             end)
-        elseif event == "UNIT_EXITED_VEHICLE" then
-            if unit and unit ~= "player" then return end
-            if _broadcasterActive then
-                _broadcasterActive = false
-                if ActionBarButtonEventsFrame then ActionBarButtonEventsFrame:UnregisterAllEvents() end
-                if ActionBarActionEventsFrame then ActionBarActionEventsFrame:UnregisterAllEvents() end
-            end
         end
     end)
 end
@@ -1539,7 +1587,13 @@ local BUTTON_EVENT_LISTS = {
         "ACTIONBAR_UPDATE_STATE",
         "ACTIONBAR_UPDATE_USABLE",
         "ACTIONBAR_UPDATE_COOLDOWN",
-        "ACTIONBAR_SLOT_CHANGED",
+        -- ACTIONBAR_SLOT_CHANGED is deliberately NOT registered per button.
+        -- Mouseover-conditional macros re-resolve on every mouseover flip and
+        -- fire it dozens of times per second; dispatching that to the mixin
+        -- OnEvent of every button burned whole frames (profiled: ~7s CPU per
+        -- 10s of sweeping the cursor across nameplates). The central
+        -- dispatcher runs UpdateAction for the matching slot and clears stale
+        -- count text -- everything the mixin's handler did.
         "PLAYER_ENTERING_WORLD",
         "UPDATE_SHAPESHIFT_FORM",
         "SPELL_UPDATE_CHARGES",
@@ -1623,6 +1677,38 @@ local function GetOrCreateButton(slot, parent, info, index, skipProtected)
             -- atlases on every call. With 96 buttons this causes mass GPU redraws.
             -- We handle button art ourselves in MakeButtonSquare/ApplyPushedTextures.
             btn.UpdateButtonArt = function() end
+        end
+        -- 12.1's template OnLoad self-registers ACTIONBAR_SLOT_CHANGED on the
+        -- button. The central dispatcher owns that event (see the
+        -- BUTTON_EVENT_LISTS note): the mixin's own handler runs Update()
+        -- under our execution taint (the UpdateButtonArt neuter above is a
+        -- tainted field in that chain) and errors on secret cooldown args,
+        -- plus blocked SetAttribute from UpdatePressAndHoldAction in combat.
+        -- No-op on 12.0, where the event is never self-registered.
+        btn:UnregisterEvent("ACTIONBAR_SLOT_CHANGED")
+        -- The template OnLoad also registered this button with Blizzard's
+        -- ActionBarButtonEventsFrame broadcaster. That tinsert ran under OUR
+        -- execution, so the stored entry is a tainted value: while the
+        -- broadcaster is re-enabled for the vehicle/extra button (see
+        -- ApplyBroadcaster), its dispatch loop reads the entry and the
+        -- button's whole mixin OnEvent runs tainted -- blocked SetAttribute
+        -- from UpdatePressAndHoldAction (ACTIONBAR_SLOT_CHANGED) and secret
+        -- SetCooldown rejections (ACTIONBAR_UPDATE_COOLDOWN) in combat.
+        -- UnregisterEvent cannot stop that path (it calls OnEvent directly),
+        -- and wrapping btn.OnEvent would be worse: the template wires
+        -- <OnEvent method="OnEvent"/>, so the engine's per-button dispatch
+        -- resolves the method at fire time -- a replacement function of ours
+        -- is a tainted value and would taint EVERY per-button event dispatch
+        -- (per-button cooldown updates only work because they start secure).
+        -- Instead, remove our entry from the broadcaster's list: nil it out
+        -- in place (never tremove -- shifting would rewrite later
+        -- Blizzard-owned entries as tainted values). The button loses
+        -- nothing: every event it needs is self-registered
+        -- (BUTTON_EVENT_LISTS) or handled by the central dispatcher.
+        if ActionBarButtonEventsFrame and type(ActionBarButtonEventsFrame.frames) == "table" then
+            for k, f in pairs(ActionBarButtonEventsFrame.frames) do
+                if f == btn then ActionBarButtonEventsFrame.frames[k] = nil end
+            end
         end
         -- When the pickup modifier is held (shift-click to move abilities),
         -- temporarily disable useOnKeyDown so the action doesn't fire on
@@ -2435,6 +2521,50 @@ end
 --  buttons. Avoids the per-button registration that caused 96 separate
 --  OnEvent calls per tick (visible as screen-wide black blink).
 -------------------------------------------------------------------------------
+
+-- Full per-button visual refresh for slot CONTENT changes (spec swap,
+-- drag-drop: slot numbers stay, contents change -- force-less UpdateAction
+-- short-circuits on that exact case).
+-- NEVER route this through the mixin's UpdateAction/Update from our context,
+-- on EITHER client: Update() runs UpdatePressAndHoldAction -> SetAttribute
+-- (protected write, ADDON_ACTION_BLOCKED in combat -- exists on 12.0.7 too)
+-- and ActionButton_ApplyCooldown with SECRET start/duration (rejected during
+-- tainted execution), and its writes to mixin state poison later secure
+-- OnShow/driver executions of the same button. Refresh directly with
+-- secret-tolerant setters instead: icon (SetTexture accepts secrets), count,
+-- and the cooldown swipe via the same duration-object API the dispatcher's
+-- ACTIONBAR_UPDATE_COOLDOWN branch uses.
+function EAB_VTABLE.ForceButtonRefresh(btn, action)
+    if not action then return end
+    local icon = btn.icon or btn.Icon
+    if icon then
+        icon:SetTexture(GetActionTexture(action))
+        -- The mixin's Update() HIDES the icon region for empty slots and only
+        -- re-Shows it in its filled branch. A slot that was empty before this
+        -- content change still has a hidden icon region, so painting the new
+        -- texture alone renders nothing (spec swap: spells invisible until a
+        -- hover ran Blizzard's secure Update). Gate on HasAction -- a clean
+        -- boolean -- never on the texture value, which can be secret.
+        icon:SetShown(HasAction(action))
+    end
+    if btn.Count and C_ActionBar and C_ActionBar.GetActionDisplayCount then
+        local display = C_ActionBar.GetActionDisplayCount(action)
+        btn.Count:SetText(display or "")
+    end
+    local cd = btn.cooldown
+    if cd and C_ActionBar and C_ActionBar.GetActionCooldown then
+        local cdInfo = C_ActionBar.GetActionCooldown(action)
+        if cdInfo and cdInfo.isActive then
+            local dur = C_ActionBar.GetActionCooldownDuration(action)
+            if dur and cd.SetCooldownFromDurationObject then
+                cd:SetCooldownFromDurationObject(dur)
+            end
+        else
+            cd:Clear()
+        end
+    end
+end
+
 do
     local _dispatcherSetup = false
     local _empowerReroutePending = false
@@ -2485,7 +2615,16 @@ do
                             for _, btn in ipairs(btns) do
                                 local action = btn:GetAttribute("action")
                                 if action and (arg1 == 0 or arg1 == action) then
-                                    if btn.UpdateAction then btn:UpdateAction() end
+                                    -- Slot CONTENTS changed while the slot number
+                                    -- stayed (spec swap, drag-drop): needs the forced
+                                    -- refresh path (see ForceButtonRefresh).
+                                    EAB_VTABLE.ForceButtonRefresh(btn, action)
+                                    -- Slot emptied: the refresh leaves stale count
+                                    -- text behind (buttons no longer receive
+                                    -- ACTIONBAR_SLOT_CHANGED themselves).
+                                    if btn.Count and not HasAction(action) then
+                                        btn.Count:SetText("")
+                                    end
                                 end
                             end
                         elseif event == "ACTIONBAR_UPDATE_COOLDOWN" then
@@ -2704,11 +2843,19 @@ do
                 C_Timer_After(0, function()
                     _empowerReroutePending = false
                     if InCombatLockdown() then return end
-                    if _G._EAB_UpdateKeybinds then _G._EAB_UpdateKeybinds() end
-                    for _, info in ipairs(BAR_CONFIG) do
-                        local frame = barFrames[info.key]
-                        if frame then
-                            frame:SetAttribute("eab-empower-trigger", GetTime())
+                    -- UpdateKeybinds returns false when the routing signature is
+                    -- unchanged (mouseover-conditional macro storms re-fire
+                    -- ACTIONBAR_SLOT_CHANGED every mouseover flip without changing
+                    -- any binding or empower state). Skip the secure empower
+                    -- re-trigger in that case: rebuilding bindings and running the
+                    -- ChildUpdate snippet on every bar every frame is what tanked
+                    -- FPS while hovering across nameplates.
+                    if _G._EAB_UpdateKeybinds and _G._EAB_UpdateKeybinds() then
+                        for _, info in ipairs(BAR_CONFIG) do
+                            local frame = barFrames[info.key]
+                            if frame then
+                                frame:SetAttribute("eab-empower-trigger", GetTime())
+                            end
                         end
                     end
                 end)
@@ -2723,24 +2870,25 @@ do
                     if event == "ACTIONBAR_SLOT_CHANGED" then
                         local action = eab1:GetAttribute("action")
                         if action and (arg1 == 0 or arg1 == action) then
-                            if eab1.UpdateAction then eab1:UpdateAction() end
+                            -- Content changes keep the slot number (see the
+                            -- main SLOT_CHANGED branch / ForceButtonRefresh).
+                            EAB_VTABLE.ForceButtonRefresh(eab1, action)
                         end
                     else
-                        local action = eab1:GetAttribute("action")
-                        if action and HasAction(action) then
-                            local cd = eab1.cooldown
-                            if cd then
-                                local cdInfo = C_ActionBar.GetActionCooldown(action)
-                                if cdInfo and cdInfo.isActive then
-                                    local dur = C_ActionBar.GetActionCooldownDuration(action)
-                                    if dur then cd:SetCooldownFromDurationObject(dur) end
-                                else
-                                    cd:Clear()
-                                end
-                            end
-                        end
+                        ForceCooldownPaint(eab1)
                     end
                 end
+            end
+
+            -- Blizzard's own refresh paths reset HotKey's text color: the
+            -- infrequent-events else-branch (target change, shapeshift,
+            -- charges, vehicle/override) and SPELL_UPDATE_ICON run the mixin
+            -- UpdateAction, and slot repaints can do the same from the C
+            -- side. Re-assert any custom keybind color with one deferred
+            -- color-only pass per burst. The cooldown and check-state
+            -- branches never touch text color -- skip those.
+            if event ~= "ACTIONBAR_UPDATE_COOLDOWN" and event ~= "ACTIONBAR_UPDATE_STATE" then
+                EAB:QueueHotkeyColorReassert()
             end
         end)
     end
@@ -3776,8 +3924,13 @@ local function MakeButtonSquare(btn)
     if not fd.artHooked and btn.UpdateButtonArt then
         hooksecurefunc(btn, "UpdateButtonArt", function(self)
             local sfd = EFD(self)
+            -- Coalesce: UpdateAction storms (mouseover-conditional macros) call
+            -- this many times per frame; one deferred HideBorder covers them all.
+            if sfd.artPending then return end
+            sfd.artPending = true
             if not sfd.artFn then
                 sfd.artFn = function()
+                    sfd.artPending = nil
                     if self and not self:IsForbidden() then
                         HideBorder(self)
                     end
@@ -4631,6 +4784,43 @@ function EAB:ApplyFonts()
         self:ApplyFontsForBar(info.key)
     end
     self:ApplyCooldownFonts()
+end
+
+-- Color-only re-assert for custom keybind text colors. Blizzard's own
+-- button refreshes (mixin UpdateAction / UpdateHotkeys and the usable-state
+-- recolor) reset HotKey's text color, so a custom color reverted to white
+-- on target change, combat transitions, drag-and-drop and usability flips
+-- until the next full ApplyFonts pass. This walks our buttons and
+-- re-applies ONLY the color -- no fonts, no anchors -- and does no button
+-- work at all for bars on the default white.
+function EAB:ReapplyHotkeyColors()
+    local bars = self.db and self.db.profile and self.db.profile.bars
+    if not bars then return end
+    for barKey, buttons in pairs(barButtons) do
+        local s = bars[barKey]
+        local c = s and not s.hideKeybind and s.keybindFontColor
+        if c and (c.r ~= 1 or c.g ~= 1 or c.b ~= 1) then
+            for i = 1, #buttons do
+                local hk = buttons[i] and buttons[i].HotKey
+                if hk then hk:SetTextColor(c.r, c.g, c.b) end
+            end
+        end
+    end
+end
+
+-- One deferred color pass per event burst. Storm-safe by design: the
+-- dispatcher can see dozens of ACTIONBAR_SLOT_CHANGED per second while
+-- mouseover-conditional macros re-resolve, and the pending flag coalesces
+-- an entire burst into a single next-frame color pass. State lives on EAB
+-- (this file is at the Lua 200-local chunk cap).
+function EAB:QueueHotkeyColorReassert()
+    if self._kbColorPending then return end
+    self._kbColorPending = true
+    self._kbColorRunner = self._kbColorRunner or function()
+        EAB._kbColorPending = false
+        EAB:ReapplyHotkeyColors()
+    end
+    C_Timer_After(0, self._kbColorRunner)
 end
 
 -------------------------------------------------------------------------------
@@ -5640,6 +5830,18 @@ end
 --    PetBar:           Hide during pet battle.  Only show when the player has
 --                      a pet and is not in a vehicle/override/possess state.
 -------------------------------------------------------------------------------
+-- Multi-select visibility compiler: thin delegates to the shared secure
+-- driver compiler in EllesmereUI_Visibility.lua (one grammar for Action
+-- Bars and Unit Frames). EAB table fields, not locals -- this file sits at
+-- Lua 5.1's 200-local-per-chunk cap.
+function EAB.BuildVisModeConjuncts(vm)
+    return EllesmereUI.BuildVisModeConjuncts(vm)
+end
+
+function EAB.BuildVisibilityStringMulti(hidePrefix, vm)
+    return EllesmereUI.BuildVisibilityDriverString(hidePrefix, vm)
+end
+
 local function BuildVisibilityString(info, s, visOverride)
     local key = info.key
     local vis = visOverride or s.barVisibility or "always"
@@ -5656,9 +5858,27 @@ local function BuildVisibilityString(info, s, visOverride)
     if s.visHideNoTarget then visOptHide = visOptHide .. "[noexists] hide; " end
     if s.visHideNoEnemy then visOptHide = visOptHide .. "[noharm] hide; " end
 
+    -- Authoritative multi-select set. Explicit overrides (toggle keybind,
+    -- QuickKeybind, grid drag) substitute the whole mode term exactly as
+    -- they do for single modes, so they keep the legacy path.
+    local vm
+    if not visOverride and EllesmereUI.GetActiveVisibilityModes then
+        vm = EllesmereUI.GetActiveVisibilityModes(s, "barVisibility")
+    end
+
     -- Pet bar has unique logic: it only shows when a pet is active and
     -- the player is not in a vehicle/override/possess state.
     if info.isPetBar then
+        if vm then
+            -- Multi path: combat/dragon conjuncts join the pet wrapper
+            -- bracket (AND); group modes are structurally unsupported here
+            -- (locked in the UI, stripped by sync copies).
+            local conj, negGate = EAB.BuildVisModeConjuncts(vm)
+            local bracket = "[novehicleui,pet,nooverridebar,nopossessbar"
+            if conj ~= "" then bracket = bracket .. "," .. conj:sub(1, -2) end
+            bracket = bracket .. "]"
+            return "[petbattle] hide; " .. visOptHide .. negGate .. bracket .. " show; hide"
+        end
         local petShow
         if vis == "in_combat" then
             petShow = "[combat] show; hide"
@@ -5690,6 +5910,12 @@ local function BuildVisibilityString(info, s, visOverride)
 
     -- Inject visibility-option hide clauses after the standard hide-prefix
     hidePrefix = hidePrefix .. visOptHide
+
+    -- Multi-select set: compiled tail; the legacy single-mode chain below
+    -- stays byte-identical for every scalar value.
+    if vm then
+        return EAB.BuildVisibilityStringMulti(hidePrefix, vm)
+    end
 
     -- Append visibility mode conditions
     if vis == "never" then
@@ -5761,11 +5987,15 @@ function EAB_VTABLE.ExtraBars.ShouldShowManagedNonSecureBar(s)
     if EllesmereUI and EllesmereUI.CheckVisibilityOptions and EllesmereUI.CheckVisibilityOptions(s) then
         return false
     end
+    local state = EAB_VTABLE.ExtraBars.GetManagedNonSecureVisibilityState()
+    -- Multi-select path (nil = legacy single mode below; the dragonriding
+    -- scalar also routes here, same predicate CheckVisibilityMode uses)
+    if EllesmereUI and EllesmereUI.EvalVisibilityExtended then
+        local ext = EllesmereUI.EvalVisibilityExtended(s, "barVisibility", state, EllesmereUI.VIS_CAPS_INCLUSIVE)
+        if ext ~= nil then return ext end
+    end
     if EllesmereUI and EllesmereUI.CheckVisibilityMode then
-        return EllesmereUI.CheckVisibilityMode(
-            vis,
-            EAB_VTABLE.ExtraBars.GetManagedNonSecureVisibilityState()
-        )
+        return EllesmereUI.CheckVisibilityMode(vis, state)
     end
     return vis ~= "never"
 end
@@ -5907,8 +6137,8 @@ function EAB:ApplyExtraBarVisibility()
             -- state is "hide" during pet battle, "show" otherwise
             local shouldHide = (state == "hide")
             for _, info in ipairs(EXTRA_BARS) do
-                if info.noManagedVisibility or info.blizzOwnedVisibility then
-                    -- skip: Blizzard handles pet battle visibility for these
+                if info.noManagedVisibility then
+                    -- skip
                 else
                 local key = info.key
                 local s = EAB.db and EAB.db.profile.bars[key]
@@ -6113,6 +6343,10 @@ do
 local MYSLOT_VIS_FIELDS = {
     "barVisibility", "alwaysHidden", "mouseoverEnabled", "mouseoverAlpha",
     "_savedBarAlpha", "combatShowEnabled", "combatHideEnabled", "alwaysShowButtons",
+    -- Multi-select set: backed up by reference (the shared setter assigns a
+    -- fresh table on every write, so the captured table never mutates) and
+    -- restored/cleared like any other field.
+    "visibilityModes",
 }
 
 -- Restore real visibility settings from the persisted backup, then clear it.
@@ -6159,6 +6393,9 @@ function EAB:SetMyslotForceShow(on)
             if s then
                 local wasMouseover = s.mouseoverEnabled
                 s.barVisibility = "always"
+                -- A lingering multi-select set would stay authoritative over
+                -- the forced "always"; the backup above already captured it.
+                s.visibilityModes = nil
                 s.alwaysHidden = false
                 s.mouseoverEnabled = false
                 if wasMouseover and s._savedBarAlpha then
@@ -6531,6 +6768,60 @@ local PUSHED_TYPES = {
     [6] = "none",    -- No pushed effect
 }
 
+do
+local function _setupBorderEdges(btn, storeKey, driverTex)
+    -- Edge state lives in EFD, never on the button table: StanceBar/PetBar
+    -- flow through here with BLIZZARD-owned buttons (StanceButton/
+    -- PetActionButton), which must never receive custom keys.
+    local edges = EFD(btn)[storeKey]
+    if not edges then
+        edges = {}
+        for j = 1, 4 do
+            local t = btn:CreateTexture(nil, "OVERLAY", nil, 2)
+            t:SetColorTexture(1, 1, 1, 1)
+            t:Hide()
+            edges[j] = t
+        end
+        EFD(btn)[storeKey] = edges
+        if driverTex then
+            hooksecurefunc(driverTex, "Show", function()
+                if not edges._active then return end
+                for j = 1, 4 do edges[j]:Show() end
+            end)
+            hooksecurefunc(driverTex, "Hide", function()
+                for j = 1, 4 do edges[j]:Hide() end
+            end)
+        end
+    end
+    return edges
+end
+
+local function _applyBorderEdges(edges, btn, brdSize, cr, cg, cb)
+    edges._active = true
+    local anchor = btn.icon or btn.Icon or btn
+    local PP = EllesmereUI.PP
+    for j = 1, 4 do edges[j]:SetVertexColor(cr, cg, cb, 1) end
+    edges[1]:ClearAllPoints(); edges[1]:SetPoint("TOPLEFT", anchor); edges[1]:SetPoint("TOPRIGHT", anchor)
+    if PP then PP.Height(edges[1], brdSize) else edges[1]:SetHeight(brdSize) end
+    edges[2]:ClearAllPoints(); edges[2]:SetPoint("BOTTOMLEFT", anchor); edges[2]:SetPoint("BOTTOMRIGHT", anchor)
+    if PP then PP.Height(edges[2], brdSize) else edges[2]:SetHeight(brdSize) end
+    edges[3]:ClearAllPoints(); edges[3]:SetPoint("TOPLEFT", edges[1], "BOTTOMLEFT"); edges[3]:SetPoint("BOTTOMLEFT", edges[2], "TOPLEFT")
+    if PP then PP.Width(edges[3], brdSize) else edges[3]:SetWidth(brdSize) end
+    edges[4]:ClearAllPoints(); edges[4]:SetPoint("TOPRIGHT", edges[1], "BOTTOMRIGHT"); edges[4]:SetPoint("BOTTOMRIGHT", edges[2], "TOPRIGHT")
+    if PP then PP.Width(edges[4], brdSize) else edges[4]:SetWidth(brdSize) end
+end
+
+local function _hideBorderEdges(btn, storeKey)
+    local edges = EFD(btn)[storeKey]
+    if not edges then return end
+    edges._active = false
+    for j = 1, 4 do edges[j]:Hide() end
+end
+ns._setupBorderEdges = _setupBorderEdges
+ns._applyBorderEdges = _applyBorderEdges
+ns._hideBorderEdges  = _hideBorderEdges
+end
+
 function EAB:ApplyPushedTextures()
     local p = self.db.profile
     local pType = p.pushedTextureType or 2
@@ -6551,27 +6842,28 @@ function EAB:ApplyPushedTextures()
                 local btn = buttons[i]
                 if btn and btn.PushedTexture then
                     if p.useBlizzardStyle then
-                        -- Restore Blizzard's default pushed atlas (UpdateButtonArt
-                        -- is nooped so the mixin never sets this itself).
-                        -- OVERLAY layer renders above the border frame.
                         btn.PushedTexture:SetAtlas("UI-HUD-ActionBar-IconFrame-Down", true)
                         btn.PushedTexture:SetDrawLayer("OVERLAY", 7)
                         btn.PushedTexture:ClearAllPoints()
                         btn.PushedTexture:SetAllPoints(btn)
                         btn.PushedTexture:SetVertexColor(1, 1, 1, 1)
                         btn.PushedTexture:SetAlpha(1)
+                        ns._hideBorderEdges(btn, "_pushedBorder")
                     elseif pType == 6 then
                         btn.PushedTexture:SetAlpha(0)
+                        ns._hideBorderEdges(btn, "_pushedBorder")
+                    elseif pType == 5 then
+                        btn.PushedTexture:SetAlpha(0)
+                        local edges = ns._setupBorderEdges(btn, "_pushedBorder", btn.PushedTexture)
+                        ns._applyBorderEdges(edges, btn, brdSize, cr, cg, cb)
                     else
                         btn.PushedTexture:SetAlpha(1)
+                        ns._hideBorderEdges(btn, "_pushedBorder")
                         if pType <= 3 then
                             SetSquareTexture(btn.PushedTexture, HIGHLIGHT_TEXTURES[pType] or HIGHLIGHT_TEXTURES[2])
                             btn.PushedTexture:SetVertexColor(cr, cg, cb, 1)
                         elseif pType == 4 then
                             btn.PushedTexture:SetColorTexture(cr, cg, cb, 0.35)
-                        elseif pType == 5 then
-                            SetSquareTexture(btn.PushedTexture, HIGHLIGHT_TEXTURES[1])
-                            btn.PushedTexture:SetVertexColor(cr, cg, cb, 1)
                         end
                     end
                 end
@@ -6677,6 +6969,7 @@ function EAB:ApplyHighlightTextures()
     local hType = p.highlightTextureType or 2
     local useCC = p.highlightUseClassColor
     local customC = p.highlightCustomColor or { r=0.973, g=0.839, b=0.604, a=1 }
+    local brdSize = p.highlightBorderSize or 4
 
     local cr, cg, cb = customC.r, customC.g, customC.b
     if useCC then
@@ -6695,16 +6988,30 @@ function EAB:ApplyHighlightTextures()
                 if btn and btn.HighlightTexture then
                     if hType == 6 then
                         btn.HighlightTexture:SetAlpha(0)
+                        ns._hideBorderEdges(btn, "_highlightBorder")
+                    elseif hType == 5 then
+                        btn.HighlightTexture:SetAlpha(0)
+                        local edges = ns._setupBorderEdges(btn, "_highlightBorder")
+                        ns._applyBorderEdges(edges, btn, brdSize, cr, cg, cb)
+                        if not EFD(btn).hlBorderHooked then
+                            EFD(btn).hlBorderHooked = true
+                            btn:HookScript("OnEnter", function(self)
+                                local be = EFD(self)._highlightBorder
+                                if be and be._active then for j = 1, 4 do be[j]:Show() end end
+                            end)
+                            btn:HookScript("OnLeave", function(self)
+                                local be = EFD(self)._highlightBorder
+                                if be then for j = 1, 4 do be[j]:Hide() end end
+                            end)
+                        end
                     else
                         btn.HighlightTexture:SetAlpha(1)
+                        ns._hideBorderEdges(btn, "_highlightBorder")
                         if hType <= 3 then
                             SetSquareTexture(btn.HighlightTexture, HIGHLIGHT_TEXTURES[hType] or HIGHLIGHT_TEXTURES[1])
                             btn.HighlightTexture:SetVertexColor(cr, cg, cb, 1)
                         elseif hType == 4 then
                             btn.HighlightTexture:SetColorTexture(cr, cg, cb, 0.35)
-                        elseif hType == 5 then
-                            SetSquareTexture(btn.HighlightTexture, HIGHLIGHT_TEXTURES[1])
-                            btn.HighlightTexture:SetVertexColor(cr, cg, cb, 1)
                         end
                     end
                 end
@@ -7020,30 +7327,39 @@ function EAB:HookProcGlow()
     glowFrame:RegisterEvent("ACTIONBAR_PAGE_CHANGED")
     glowFrame:RegisterEvent("UPDATE_BONUS_ACTIONBAR")
     glowFrame:RegisterEvent("SPELL_UPDATE_ICON")
+    -- Deferred full re-scan, coalesced: mouseover-conditional macros re-resolve
+    -- on every mouseover flip and fire ACTIONBAR_SLOT_CHANGED storms (dozens per
+    -- second sweeping across nameplates). One pending scan covers the whole burst.
+    local _glowRescanPending = false
+    local function GlowRescan()
+        _glowRescanPending = false
+        -- Clear glows that no longer match, add new ones
+        for btn in pairs(_procState.active) do
+            local id = GetButtonSpellID(btn)
+            if not id or not C_SpellActivationOverlay.IsSpellOverlayed(id) then
+                HideGlow(btn)
+            end
+        end
+        local blizz = IsBlizzStyle()
+        for _, info in ipairs(BAR_CONFIG) do
+            local buttons = barButtons[info.key]
+            if buttons then
+                for _, btn in ipairs(buttons) do
+                    if btn and (EFD(btn).squared or blizz) and not _procState.active[btn] then
+                        UpdateOverlayGlow(btn)
+                    end
+                end
+            end
+        end
+    end
     glowFrame:SetScript("OnEvent", function(_, event, arg1)
         if event == "ACTIONBAR_SLOT_CHANGED" or event == "ACTIONBAR_PAGE_CHANGED" or event == "UPDATE_BONUS_ACTIONBAR" or event == "SPELL_UPDATE_ICON" then
             -- Defer re-scan: the bar may not have finished paging yet
             -- when the event fires, so slot->spell mappings are stale.
-            C_Timer_After(0, function()
-                -- Clear glows that no longer match, add new ones
-                for btn in pairs(_procState.active) do
-                    local id = GetButtonSpellID(btn)
-                    if not id or not C_SpellActivationOverlay.IsSpellOverlayed(id) then
-                        HideGlow(btn)
-                    end
-                end
-                local blizz = IsBlizzStyle()
-                for _, info in ipairs(BAR_CONFIG) do
-                    local buttons = barButtons[info.key]
-                    if buttons then
-                        for _, btn in ipairs(buttons) do
-                            if btn and (EFD(btn).squared or blizz) and not _procState.active[btn] then
-                                UpdateOverlayGlow(btn)
-                            end
-                        end
-                    end
-                end
-            end)
+            if not _glowRescanPending then
+                _glowRescanPending = true
+                C_Timer_After(0, GlowRescan)
+            end
             return
         end
         local isShow = (event == "SPELL_ACTIVATION_OVERLAY_GLOW_SHOW")
@@ -7497,9 +7813,37 @@ local _bindState = { housingCleared = false }
 -- systems work natively without pressAndHoldAction/typerelease attrs.
 local _eabBindOwner = CreateFrame("Frame", "EAB_BindOwner", UIParent)
 
+-- Returns true when the override bindings were (re)applied, false when the
+-- routing signature was unchanged and the rebuild was skipped.
+--
+-- The signature cache exists because rebuilding is expensive: it clears and
+-- re-registers up to two override bindings per button (engine binding-table
+-- rebuilds), plus GetActionInfo/IsPressHoldReleaseSpell per slot. The empower
+-- reroute calls this on ACTIONBAR_SLOT_CHANGED, which storms dozens of times
+-- per second while sweeping the mouse across nameplates with
+-- mouseover-conditional macros on the bars (each flip re-resolves the macros).
+-- Slot contents changing does NOT change the bindings themselves (keys map to
+-- native commands or button names, not to actions), so the rebuild only needs
+-- to run when a routing decision, a bound key, or a button's empower state
+-- actually changes.
 local function UpdateKeybinds()
-    if InCombatLockdown() then return end
-    ClearOverrideBindings(_eabBindOwner)
+    if InCombatLockdown() then return false end
+    -- While the house editor is active our override bindings are cleared so
+    -- Blizzard's housing hotkeys work (see Housing Editor Keybind Clearing).
+    -- The editor registers its OWN override bindings after ours are cleared,
+    -- and that registration fires UPDATE_BINDINGS -- which routes right back
+    -- here. Without this guard the rebuild re-applied all ~200 of our
+    -- overrides on top of the editor's, stomping the housing hotkeys until
+    -- the editor re-applied them on the next mode change. Rebuild resumes on
+    -- editor close (housingCleared reset -> UpdateKeybinds; sigValid stays
+    -- false while cleared, so that rebuild is never skipped).
+    if _bindState.housingCleared then return false end
+    -- Pass 1: compute per-button routing signature (k1, k2, useClick, isPH)
+    -- and compare against the last applied build.
+    local sig = _bindState.sig
+    if not sig then sig = {}; _bindState.sig = sig end
+    local n = 0
+    local changed = not _bindState.sigValid
     for _, info in ipairs(BAR_CONFIG) do
         local prefix = BINDING_MAP[info.key]
         local btns = barButtons[info.key]
@@ -7515,6 +7859,12 @@ local function UpdateKeybinds()
             -- ElvUI/Bartender do for every button via LibActionButton.
             local bs = EAB and EAB.db and EAB.db.profile and EAB.db.profile.bars[info.key]
             local barHasCustomPaging = (bs and bs.paging and next(bs.paging) ~= nil) and true or false
+            if not barHasCustomPaging and info.key == "MainBar" then
+                local _, cls = UnitClass("player")
+                if cls == "DRUID" or cls == "ROGUE" then
+                    barHasCustomPaging = true
+                end
+            end
             for i, btn in ipairs(btns) do
                 if btn then
                     local cmd = prefix .. i
@@ -7529,11 +7879,15 @@ local function UpdateKeybinds()
                     -- Custom bars (Bar9/Bar10) have no native binding command, so
                     -- their keys MUST route through the button (SetOverrideBindingClick);
                     -- SetOverrideBinding to a non-existent command would do nothing.
-                    local useClick = barHasCustomPaging or (info.customPage ~= nil)
+                    -- isPH tracks empower/flyout separately from useClick: on a
+                    -- custom-paged bar useClick is always true, but the secure
+                    -- empower snippet still needs a re-trigger when a slot's
+                    -- press-and-hold state flips.
+                    local isPH = false
                     if slot and HasAction(slot) then
                         local actionType, id, subType = GetActionInfo(slot)
                         if actionType == "flyout" then
-                            useClick = true
+                            isPH = true
                         elseif C_Spell and C_Spell.IsPressHoldReleaseSpell then
                             local spellID
                             if actionType == "spell" then
@@ -7543,10 +7897,37 @@ local function UpdateKeybinds()
                             end
                             if spellID and not (issecretvalue and issecretvalue(spellID))
                                and C_Spell.IsPressHoldReleaseSpell(spellID) then
-                                useClick = true
+                                isPH = true
                             end
                         end
                     end
+                    local useClick = isPH or barHasCustomPaging or (info.customPage ~= nil)
+                    k1 = k1 or false
+                    k2 = k2 or false
+                    if sig[n + 1] ~= k1 or sig[n + 2] ~= k2
+                       or sig[n + 3] ~= useClick or sig[n + 4] ~= isPH then
+                        changed = true
+                    end
+                    sig[n + 1], sig[n + 2], sig[n + 3], sig[n + 4] = k1, k2, useClick, isPH
+                    n = n + 4
+                end
+            end
+        end
+    end
+    if _bindState.sigN ~= n then changed = true; _bindState.sigN = n end
+    if not changed then return false end
+    _bindState.sigValid = true
+    -- Pass 2: apply. Reads the routing decisions computed above.
+    ClearOverrideBindings(_eabBindOwner)
+    local j = 0
+    for _, info in ipairs(BAR_CONFIG) do
+        local prefix = BINDING_MAP[info.key]
+        local btns = barButtons[info.key]
+        if prefix and btns then
+            for i, btn in ipairs(btns) do
+                if btn then
+                    local k1, k2, useClick = sig[j + 1], sig[j + 2], sig[j + 3]
+                    j = j + 4
                     if useClick then
                         local btnName = btn:GetName()
                         if k1 and btnName then
@@ -7556,6 +7937,7 @@ local function UpdateKeybinds()
                             SetOverrideBindingClick(_eabBindOwner, false, k2, btnName)
                         end
                     else
+                        local cmd = prefix .. i
                         if k1 then
                             SetOverrideBinding(_eabBindOwner, false, k1, cmd)
                         end
@@ -7567,6 +7949,7 @@ local function UpdateKeybinds()
             end
         end
     end
+    return true
 end
 _G._EAB_UpdateKeybinds = UpdateKeybinds
 
@@ -7728,6 +8111,9 @@ if IsHouseEditorActive then
             _bindState.housingCleared = true
             if not InCombatLockdown() then
                 ClearOverrideBindings(_eabBindOwner)
+                -- Bindings no longer match the cached signature; force the
+                -- next UpdateKeybinds to rebuild even if routing is identical.
+                _bindState.sigValid = false
             end
         else
             -- House editor closed restore our override bindings
@@ -8382,16 +8768,44 @@ function EAB:OnInitialize()
 
     -- Hide quality overlay on newly-placed items (overlay is created lazily
     -- by Blizzard after the slot changes, so defer the check by one frame).
+    -- Coalesced: ACTIONBAR_SLOT_CHANGED storms (mouseover-conditional macros
+    -- re-resolving) collapse into one deferred scan per frame.
     do
         local qf = CreateFrame("Frame")
-        qf:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
-        qf:SetScript("OnEvent", function()
-            C_Timer_After(0, function()
+        local _qPending = false
+        local function QualityScan()
+                _qPending = false
                 local bars = EAB.db.profile.bars
                 for _, info in ipairs(BAR_CONFIG) do
                     local btns = barButtons[info.key]
                     local s = bars[info.key]
-                    if btns and s and not s.showRankIcon then
+                    if btns and s and s.showRankIcon then
+                        -- Feature ON: Blizzard does NOT refresh the quality
+                        -- overlay when an item is swapped in place (rank 1 ->
+                        -- rank 2 potion in the same slot), so it keeps showing
+                        -- the previous item's rank until a hover forces the
+                        -- button's own update. Re-run that update here so the
+                        -- rank tracks the new item immediately.
+                        for _, btn in ipairs(btns) do
+                            -- Rank icons only apply to items, so only run the
+                            -- (item-info-querying) refresh on item slots -- an
+                            -- ACTIONBAR_SLOT_CHANGED storm from mouseover-macros
+                            -- re-resolving fires in combat, and this must not
+                            -- do a quality lookup on every spell button per
+                            -- frame. A non-item slot (spell swapped in, or the
+                            -- slot cleared) just gets any lingering rank hidden.
+                            local action = btn:GetAttribute("action") or 0
+                            if action > 0 and GetActionInfo
+                               and GetActionInfo(action) == "item" then
+                                if btn.UpdateProfessionQuality then
+                                    btn:UpdateProfessionQuality()
+                                end
+                            else
+                                local ov = btn.ProfessionQualityOverlayFrame
+                                if ov and ov:IsShown() then ov:SetShown(false) end
+                            end
+                        end
+                    elseif btns and s and not s.showRankIcon then
                         for _, btn in ipairs(btns) do
                             local ov = btn.ProfessionQualityOverlayFrame
                             if ov and ov:IsShown() then
@@ -8410,7 +8824,13 @@ function EAB:OnInitialize()
                         end
                     end
                 end
-            end)
+        end
+        qf:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+        qf:SetScript("OnEvent", function()
+            if not _qPending then
+                _qPending = true
+                C_Timer_After(0, QualityScan)
+            end
         end)
     end
 
@@ -8729,11 +9149,11 @@ function EAB:FinishSetup()
             self:ScanExistingProcs()
             -- Re-scan after a delay to catch procs that Blizzard populates late
             C_Timer_After(2, function() self:ScanExistingProcs() end)
-            -- Our fresh EABButton frames are not registered with
-            -- ActionBarButtonEventsFrame (doing so causes taint), so
-            -- the mixin's OnEvent never fires on them. Register our
-            -- own ACTIONBAR_SLOT_CHANGED listener on each fresh button
-            -- to clear stale count text when a slot becomes empty.
+            -- Clear stale count text when a slot becomes empty. The central
+            -- dispatcher's ACTIONBAR_SLOT_CHANGED branch handles this for our
+            -- fresh EABButton frames (a per-button listener here dispatched
+            -- every slot-change storm event to every button); the UpdateCount
+            -- hook covers Blizzard buttons that receive events natively.
             for _, info in ipairs(BAR_CONFIG) do
                 if not info.isStance and not info.isPetBar then
                     local btns = barButtons[info.key]
@@ -8741,27 +9161,10 @@ function EAB:FinishSetup()
                         for _, b in ipairs(btns) do
                             if not b._eabCountFixed then
                                 b._eabCountFixed = true
-                                -- Hook UpdateCount for Blizzard buttons
-                                -- that already receive events natively.
                                 if b.UpdateCount then
                                     hooksecurefunc(b, "UpdateCount", function(self)
                                         if not self:HasAction() then
                                             self.Count:SetText("")
-                                        end
-                                    end)
-                                end
-                                -- For our fresh buttons, listen for slot
-                                -- changes directly and clear count text.
-                                if b:GetName() and b:GetName():match("^EABButton") then
-                                    b:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
-                                    b:HookScript("OnEvent", function(self, event, slotOrArg)
-                                        if event == "ACTIONBAR_SLOT_CHANGED" then
-                                            local action = self:GetAttribute("action") or 0
-                                            if slotOrArg == 0 or slotOrArg == action then
-                                                if not HasAction(action) then
-                                                    self.Count:SetText("")
-                                                end
-                                            end
                                         end
                                     end)
                                 end
@@ -9219,6 +9622,18 @@ function EAB:FinishSetup()
     self:RegisterEvent("UPDATE_SHAPESHIFT_FORM", function()
         self:UpdateHousingVisibility()
     end)
+    -- Dragonriding visibility modes on the managed non-secure bars:
+    -- capability edge plus the airborne edge (probed at load in
+    -- EllesmereUI_Visibility.lua; the secure bars need neither -- their
+    -- state driver re-evaluates [advflyable,flying] natively).
+    self:RegisterEvent("PLAYER_CAN_GLIDE_CHANGED", function()
+        self:UpdateHousingVisibility()
+    end)
+    if EllesmereUI._hasGlidingEvent then
+        self:RegisterEvent("PLAYER_IS_GLIDING_CHANGED", function()
+            self:UpdateHousingVisibility()
+        end)
+    end
     -- Immediate soft-target override: when the only "target" is a soft-
     -- interact NPC (dialogue in view cone), the [noexists] state driver
     -- instantly shows the bar. Override to "hide" in the same frame so
@@ -9404,13 +9819,16 @@ function EAB:FinishSetup()
             -- ACTIONBAR_SLOT_CHANGED handler may not fire UpdateAction
             -- on our EABButton frames (double-template). Without this,
             -- cooldown swipes (including GCD) can disappear after swap.
+            -- A spec swap changes slot CONTENTS while the slot numbers stay
+            -- identical, so this needs the forced refresh path (see
+            -- ForceButtonRefresh; also handles the 12.1 secret-safe variant).
             for _, info in ipairs(BAR_CONFIG) do
                 if not info.isStance and not info.isPetBar then
                     local btns = barButtons[info.key]
                     if btns then
                         for _, btn in ipairs(btns) do
-                            if btn and btn.UpdateAction then
-                                btn:UpdateAction()
+                            if btn then
+                                EAB_VTABLE.ForceButtonRefresh(btn, btn:GetAttribute("action"))
                             end
                         end
                     end
@@ -10652,12 +11070,48 @@ local function SetupBlizzardMovableFrame(barKey)
         ExtraAbilityContainer:SetScript("OnShow", nil)
         ExtraAbilityContainer:SetScript("OnHide", nil)
 
-        -- Hook AddFrame so newly added ability buttons stay clickable.
+        -- Refresh ExtraActionButton1's keybind text and cooldown swipe. The
+        -- broadcaster kill at load prevents Blizzard's UPDATE_BINDINGS and
+        -- cooldown updates from reaching this button, so we drive both here.
+        -- UpdateAction runs first; the keybind is set after it so Blizzard's own
+        -- UpdateHotkeys (which hides the key when GetBindingKey is momentarily
+        -- nil) can't clobber our text. Unlike the cooldown -- which recovers via
+        -- the ACTIONBAR_UPDATE_COOLDOWN dispatcher -- the keybind has no such
+        -- fallback, so every path that can reveal the button refreshes it.
+        local function RefreshExtraActionButton()
+            local eab1 = ExtraActionButton1
+            if not eab1 then return end
+            if eab1.UpdateAction then eab1:UpdateAction() end
+            local hk = eab1.HotKey
+            if hk then
+                local key1 = GetBindingKey("EXTRAACTIONBUTTON1")
+                if key1 then
+                    hk:SetText(FormatHotkeyText(key1))
+                    hk:Show()
+                end
+            end
+            ForceCooldownPaint(eab1)
+            -- Re-evaluate the broadcaster need now: this container Show/AddFrame
+            -- refresh is a reliable delve-entry signal (the button's own OnShow
+            -- doesn't fire then), and RefreshBroadcaster reads the button's
+            -- actual visibility to decide.
+            if ns.RefreshBroadcaster then
+                ns.RefreshBroadcaster()
+            end
+        end
+
+        -- Hook AddFrame so newly added ability buttons stay clickable, and
+        -- refresh the extra action button. When the container is already shown
+        -- (e.g. a zone ability is active) and the extra action button then
+        -- becomes active, that fires AddFrame but not the container's Show hook,
+        -- so this is the only refresh signal for that path. Deferred one frame so
+        -- Blizzard has finished assigning the button's action before we read it.
         if ExtraAbilityContainer.AddFrame then
             hooksecurefunc(ExtraAbilityContainer, "AddFrame", function(_, frame)
                 if frame and frame.EnableMouse and not InCombatLockdown() then
                     frame:EnableMouse(true)
                 end
+                C_Timer_After(0, RefreshExtraActionButton)
             end)
         end
 
@@ -10700,22 +11154,17 @@ local function SetupBlizzardMovableFrame(barKey)
             if ExtraAbilityContainer:GetParent() ~= holder then
                 RepositionExtraContainer()
             end
-            -- Refresh keybind text on ExtraActionButton1. The broadcaster
-            -- kill at load time prevents Blizzard's UPDATE_BINDINGS from
-            -- reaching the button, so we update it here on show.
-            local eab1 = ExtraActionButton1
-            if eab1 then
-                local hk = eab1.HotKey
-                if hk then
-                    local key1 = GetBindingKey("EXTRAACTIONBUTTON1")
-                    if key1 then
-                        hk:SetText(FormatHotkeyText(key1))
-                        hk:Show()
-                    end
-                end
-                if eab1.UpdateAction then eab1:UpdateAction() end
-            end
+            RefreshExtraActionButton()
         end)
+
+        -- Quick-reload catch-up: if the button is already showing, its Show (and
+        -- AddFrame) fired before this deferred setup registered the hooks above,
+        -- so we missed them. Refresh now so the keybind isn't left blank until
+        -- the next show -- the cooldown recovers on its own via the dispatcher,
+        -- the keybind has no such fallback.
+        if ExtraActionButton1 and ExtraActionButton1:IsShown() then
+            RefreshExtraActionButton()
+        end
     end
 
     -- Encounter Bar: reparent into holder, mark as user-placed so Blizzard's
@@ -12051,10 +12500,25 @@ end)
         end
     end
     _G._EAB_ScanSwiftmend = ScanABSwiftmend
+    -- The scan is druid-only (it bails on class), so non-druids get no
+    -- listener at all: class never changes within a session.
+    local _, _playerCls = UnitClass("player")
+    if _playerCls ~= "DRUID" then return end
     local f = CreateFrame("Frame")
     f:RegisterEvent("PLAYER_ENTERING_WORLD")
     f:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
+    -- Coalesced: one 0.5s rescan window at a time. ACTIONBAR_SLOT_CHANGED can
+    -- storm (mouseover-conditional macros re-resolving on every mouseover flip);
+    -- scheduling a timer per event ran the full scan dozens of times per second.
+    local _smPending = false
+    local function SwiftmendRescan()
+        _smPending = false
+        ScanABSwiftmend()
+    end
     f:SetScript("OnEvent", function()
-        C_Timer.After(0.5, ScanABSwiftmend)
+        if not _smPending then
+            _smPending = true
+            C_Timer.After(0.5, SwiftmendRescan)
+        end
     end)
 end)()

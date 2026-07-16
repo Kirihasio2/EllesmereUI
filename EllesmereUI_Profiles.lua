@@ -79,6 +79,7 @@ local ADDON_DB_MAP = {
     { folder = "EllesmereUIMinimap",           display = "Minimap",             svName = "EllesmereUIMinimapDB",           suffix = "Minimap"           },
     { folder = "EllesmereUIDamageMeters",     display = "Damage Meters",       svName = "EllesmereUIDamageMetersDB",      suffix = "DamageMeters"      },
     { folder = "EllesmereUIChat",             display = "Chat",                svName = "EllesmereUIChatDB",              suffix = "Chat"              },
+    { folder = "EllesmereUIDataBars",         display = "DataBars",            svName = "EllesmereUIDataBarsDB",          suffix = "DataBars"          },
 }
 EllesmereUI._ADDON_DB_MAP = ADDON_DB_MAP
 
@@ -257,7 +258,21 @@ function Serializer.Serialize(tbl)
 end
 
 -- Deserializer
+-- Optional cooperative-yield hook: when set (async decode), DeserializeValue
+-- calls it periodically with the current parse position so a wrapping
+-- coroutine can spread the work across frames. nil (the default) keeps all
+-- synchronous callers exactly as before.
+local deserializeYieldHook
+local deserializeOps = 0
+
 local function DeserializeValue(str, pos)
+    if deserializeYieldHook then
+        deserializeOps = deserializeOps + 1
+        if deserializeOps >= 2048 then
+            deserializeOps = 0
+            deserializeYieldHook(pos)
+        end
+    end
     local tag = str:sub(pos, pos)
     if tag == "s" then
         -- Find the colon after the length
@@ -310,6 +325,12 @@ function Serializer.Deserialize(str)
     if not str or #str == 0 then return nil end
     local val, _ = DeserializeValue(str, 1)
     return val
+end
+
+-- Install/clear the deserializer's cooperative-yield hook (async decode).
+function Serializer.SetYieldHook(fn)
+    deserializeYieldHook = fn
+    deserializeOps = 0
 end
 
 EllesmereUI._Serializer = Serializer
@@ -688,6 +709,27 @@ local function RepointAllDBs(profileName)
         EllesmereUIDB.unlockWidthMatch  = DeepCopy(ul.widthMatch   or {})
         EllesmereUIDB.unlockHeightMatch = DeepCopy(ul.heightMatch  or {})
         EllesmereUIDB.phantomBounds     = DeepCopy(ul.phantomBounds or {})
+        -- unlockLayout snapshots always carry BASELINE links (CommitPositions
+        -- sources them from the stored baseline layout while a group layer is
+        -- live), so live now holds the baseline: reset the incoming profile's
+        -- active-layer pointer to match. SpecOverrides_ApplyUnlock re-applies
+        -- the right group layer for the incoming spec right after.
+        if EllesmereUI.SpecOverrides_UnlockResetActive then
+            EllesmereUI.SpecOverrides_UnlockResetActive(profileData)
+        end
+        -- Buff Manager forks have NO baseline snapshot restore (the RF addon
+        -- profile is the live data and travels with the blob), so their
+        -- pointer stays consistent -- only orphan pointers are healed.
+        if EllesmereUI.SpecOverrides_BmResetActive then
+            EllesmereUI.SpecOverrides_BmResetActive(profileData)
+        end
+        -- Tracking Bar link entries in the snapshot are stale copies of
+        -- whichever spec last saved unlock mode -- TBB links are per-spec
+        -- (CDM-owned buckets). Re-assert the active spec's own entries over
+        -- the freshly restored stores.
+        if EllesmereUI._TBBRestoreUnlockLinks then
+            EllesmereUI._TBBRestoreUnlockLinks()
+        end
     end
     -- Seed castbar anchor defaults ONLY on brand-new profiles (no unlockLayout
     -- yet). Re-seeding every load would clobber a user's deliberate un-anchor
@@ -876,8 +918,23 @@ function EllesmereUI.SnapshotAllAddons()
             data.specOverrideGroups = DeepCopy(prof.specOverrideGroups)
             data.specOverrideNextId = prof.specOverrideNextId
         end
+        if prof and type(prof.condOverrideGroups) == "table" and #prof.condOverrideGroups > 0 then
+            data.condOverrideGroups = DeepCopy(prof.condOverrideGroups)
+        end
+        if prof and type(prof.condOverrides) == "table" and #prof.condOverrides > 0 then
+            data.condOverrides = DeepCopy(prof.condOverrides)
+        end
+        if prof and type(prof.condUnlockOverrides) == "table" then
+            data.condUnlockOverrides = DeepCopy(prof.condUnlockOverrides)
+        end
         if prof and type(prof.specUnlockOverrides) == "table" then
             data.specUnlockOverrides = DeepCopy(prof.specUnlockOverrides)
+        end
+        if prof and type(prof.condBmOverrides) == "table" then
+            data.condBmOverrides = DeepCopy(prof.condBmOverrides)
+        end
+        if prof and type(prof.specBmOverrides) == "table" then
+            data.specBmOverrides = DeepCopy(prof.specBmOverrides)
         end
     end
     -- Include unlock mode layout data (anchors, size matches)
@@ -948,6 +1005,16 @@ end
 function EllesmereUI.ApplyProfileData(profileData)
     if not profileData or not profileData.addons then return end
 
+    -- Any open editing-as session (spec group / conditional / Default view)
+    -- must close BEFORE the live tables are wiped and refilled: the exits
+    -- bank against the outgoing store, and the post-apply establish
+    -- (Conditions_MarkStale + Recheck) refuses to run under a live session,
+    -- which would strand the incoming profile un-overlaid ("bricked") until
+    -- the next zone change.
+    if EllesmereUI.SpecOverrides_CloseEditSessions then
+        EllesmereUI.SpecOverrides_CloseEditSessions()
+    end
+
     -- Build a folder -> db lookup from the Lite registry
     local dbByFolder = {}
     if EllesmereUI.Lite and EllesmereUI.Lite._dbRegistry then
@@ -978,6 +1045,30 @@ function EllesmereUI.ApplyProfileData(profileData)
                 if entry.folder == "EllesmereUIUnitFrames" and type(profile.totPet) == "table" then
                     if profile.targettarget == nil then profile.targettarget = DeepCopy(profile.totPet) end
                     if profile.focustarget  == nil then profile.focustarget  = DeepCopy(profile.totPet) end
+                end
+                -- Old-profile imports carry customized boss regular text keys
+                -- but no simple* twins. Simple Debuff Display defaults ON and
+                -- reads the simple* keys, which DeepMergeDefaults fills with
+                -- false/14, orphaning the user's stored sizes. The seed
+                -- migration (uf_boss_simple_text_seed_v1) is SKIPPED for
+                -- imported profiles (inherited migration flags), so
+                -- forward-copy here BEFORE the merge masks the nil keys.
+                if entry.folder == "EllesmereUIUnitFrames" and type(profile.boss) == "table" then
+                    local b = profile.boss
+                    if b.simpleDebuffCooldownTextSize == nil
+                        and type(b.debuffCooldownTextSize) == "number" and b.debuffCooldownTextSize ~= 10 then
+                        b.simpleDebuffCooldownTextSize = b.debuffCooldownTextSize
+                    end
+                    if b.simpleDebuffShowCooldownText == nil and b.debuffShowCooldownText == true then
+                        b.simpleDebuffShowCooldownText = true
+                    end
+                    if b.simpleBuffCooldownTextSize == nil
+                        and type(b.buffCooldownTextSize) == "number" and b.buffCooldownTextSize ~= 10 then
+                        b.simpleBuffCooldownTextSize = b.buffCooldownTextSize
+                    end
+                    if b.simpleBuffShowCooldownText == nil and b.buffShowCooldownText == true then
+                        b.simpleBuffShowCooldownText = true
+                    end
                 end
                 -- Pre-MultiBag imports carry the legacy bagDefaultOneBag boolean
                 -- but no bagDefaultBagType. The conversion migration is SKIPPED for
@@ -1094,6 +1185,13 @@ function EllesmereUI.ApplyProfileData(profileData)
             EllesmereUIDB.unlockWidthMatch  = DeepCopy(ul.widthMatch   or {})
             EllesmereUIDB.unlockHeightMatch = DeepCopy(ul.heightMatch  or {})
             EllesmereUIDB.phantomBounds     = DeepCopy(ul.phantomBounds or {})
+            -- Tracking Bar link entries in the snapshot are stale copies of
+            -- whichever spec last saved unlock mode -- TBB links are
+            -- per-spec (CDM-owned buckets). Re-assert the active spec's own
+            -- entries over the freshly restored stores.
+            if EllesmereUI._TBBRestoreUnlockLinks then
+                EllesmereUI._TBBRestoreUnlockLinks()
+            end
         end
         -- If profile predates unlockLayout, leave live data untouched
     end
@@ -1110,6 +1208,9 @@ function EllesmereUI.RefreshAllAddons()
     -- Spec Overrides: write the current spec's override values into the live
     -- profile FIRST, so every module refresh below picks them up. This makes
     -- profile swaps and imports override-correct without their own pass.
+    -- (The import-time default re-bank runs SYNCHRONOUSLY inside
+    -- ImportProfile, never from here: by the time any RefreshAllAddons fires,
+    -- overlays may already be live and re-banking would poison defaults.)
     if EllesmereUI.SpecOverrides_ApplyValues then
         EllesmereUI.SpecOverrides_ApplyValues()
     end
@@ -1177,6 +1278,8 @@ function EllesmereUI.RefreshAllAddons()
     if _G._EMT_Apply then _G._EMT_Apply() end
     -- Damage Meters
     if _G._EDM_Apply then _G._EDM_Apply() end
+    -- DataBars (bar set + blocks + layout + positions are all per-profile)
+    if _G._EDB_Apply then _G._EDB_Apply() end
     -- Dragon Riding HUD
     if _G._EDR_Rebuild then _G._EDR_Rebuild() end
     -- Minimap (flyout button state)
@@ -1194,6 +1297,7 @@ function EllesmereUI.RefreshAllAddons()
     if _G._EABR_RegisterUnlock then _G._EABR_RegisterUnlock() end
     if _G._ECL_RegisterUnlock then _G._ECL_RegisterUnlock() end
     if _G._EUI_BattleRes_RegisterUnlock then _G._EUI_BattleRes_RegisterUnlock() end
+    if _G._EDB_RegisterUnlock then _G._EDB_RegisterUnlock() end
     -- After all addons have rebuilt and positioned their frames from
     -- db.profile.positions, re-apply centralized grow-direction positioning
     -- (handles lazy migration of imported TOPLEFT positions to CENTER format)
@@ -1225,6 +1329,13 @@ function EllesmereUI.RefreshAllAddons()
     if EllesmereUI.IsShown and EllesmereUI:IsShown() and EllesmereUI.RefreshPage then
         EllesmereUI:RefreshPage(true)
     end
+    -- Conditional overrides: a profile apply swaps every store wholesale, so
+    -- the engine's applied pointer refers to the OLD profile's groups. Reset
+    -- it and re-establish the overlay against the incoming profile.
+    if EllesmereUI.Conditions_MarkStale then
+        EllesmereUI.Conditions_MarkStale()
+        EllesmereUI.Conditions_Recheck()
+    end
     -- If CDM is loaded, it calls OnSpecSwitchComplete from ProcessSpecChange
     -- after its SPELLS_CHANGED rebuild finishes. If CDM is NOT loaded,
     -- complete immediately since there's nothing to wait for.
@@ -1255,6 +1366,12 @@ function EllesmereUI.OnSpecSwitchComplete()
     end
     if EllesmereUI.ResyncAnchorOffsets then
         EllesmereUI.ResyncAnchorOffsets()
+    end
+    -- A conditional establish/flip that found the spec pipeline mid-flight
+    -- deferred itself (the transition handler returns false while busy).
+    -- The pipeline is settled now -- resolve it. No-op when nothing changed.
+    if EllesmereUI.Conditions_Recheck then
+        EllesmereUI.Conditions_Recheck()
     end
 end
 
@@ -1821,6 +1938,167 @@ function EllesmereUI.DecodeImportString(importStr)
 end
 
 -------------------------------------------------------------------------------
+--  Async import decode
+--
+--  DecodeImportString runs decode -> decompress -> deserialize in one
+--  synchronous call; on very large strings that stalls the client for
+--  seconds. DecodeImportStringAsync produces the identical payload but
+--  spreads the work across frames on a small per-frame time budget:
+--    - the printable decode runs in fixed-size slices (the codec is
+--      block-based, so slicing on 4-char boundaries is lossless),
+--    - decompression uses the client's native inflate when available
+--      (LibDeflate fallback otherwise -- both read the same deflate stream),
+--    - deserialization yields through the Serializer hook above.
+--
+--  onDone(payload, err) fires exactly once -- on a later frame, or
+--  immediately for the cheap validation failures. onProgress(fraction) is
+--  optional and approximate, for UI feedback. Returns a handle with
+--  :Cancel() (drops the run; onDone never fires), or nil when onDone was
+--  already called synchronously. Starting a new run cancels an active one.
+-------------------------------------------------------------------------------
+do
+    local BUDGET_MS = 8       -- per-frame work slice
+    local SLICE_LEN = 65536   -- printable-decode slice (multiple of 4)
+
+    local driver    -- shared OnUpdate frame, hidden while idle
+    local active    -- state table of the in-flight run, or nil
+
+    local function StopRun(run)
+        if active == run then
+            active = nil
+            Serializer.SetYieldHook(nil)
+            if driver then driver:Hide() end
+        end
+    end
+
+    function EllesmereUI.DecodeImportStringAsync(importStr, onDone, onProgress)
+        -- Cheap validations first (same messages as DecodeImportString).
+        if not importStr or #importStr < 5 then
+            onDone(nil, "Invalid string")
+            return nil
+        end
+        if importStr:sub(1, 9) == "!EUICDM_" then
+            onDone(nil, "This is an old CDM Bar Layout string. This format is no longer supported. Use the standard profile import instead.")
+            return nil
+        end
+        if importStr:sub(1, #EXPORT_PREFIX) ~= EXPORT_PREFIX then
+            onDone(nil, "Not a valid EllesmereUI string. Make sure you copied the entire string.")
+            return nil
+        end
+        if not LibDeflate then
+            onDone(nil, "LibDeflate not available")
+            return nil
+        end
+
+        if active then StopRun(active) end
+        local run = {}
+        active = run
+
+        local sliceStart = 0
+        local function Yield(frac)
+            if onProgress and frac then onProgress(frac) end
+            -- Only ever yield our own coroutine: the Serializer hook stays
+            -- installed while this run is parked, and a synchronous
+            -- Deserialize from elsewhere must never be yielded.
+            if coroutine.running() ~= run.co then return end
+            if debugprofilestop() - sliceStart > BUDGET_MS then
+                coroutine.yield()
+            end
+        end
+
+        run.co = coroutine.create(function()
+            local encoded = importStr:sub(#EXPORT_PREFIX + 1)
+
+            -- Printable decode in slices (block codec: 4 chars -> 3 bytes,
+            -- so any 4-char boundary is a clean cut; the tail of the final
+            -- slice is handled by the codec itself).
+            local total = #encoded
+            local pieces, pn = {}, 0
+            local i = 1
+            while i <= total do
+                local j = i + SLICE_LEN - 1
+                if j > total then j = total end
+                local piece = LibDeflate:DecodeForPrint(encoded:sub(i, j))
+                if not piece then return nil, "Failed to decode string" end
+                pn = pn + 1
+                pieces[pn] = piece
+                i = j + 1
+                Yield((i / total) * 0.4)
+            end
+            local decoded = table.concat(pieces)
+            pieces = nil
+            Yield(0.42)
+
+            -- Decompress: native inflate when the client provides it, else
+            -- LibDeflate (single call). A native failure of any kind just
+            -- falls through to the library path.
+            local decompressed
+            if C_EncodingUtil and C_EncodingUtil.DecompressString
+               and Enum and Enum.CompressionMethod and Enum.CompressionMethod.Deflate then
+                local ok, res = pcall(C_EncodingUtil.DecompressString, decoded,
+                    Enum.CompressionMethod.Deflate)
+                if ok and type(res) == "string" and #res > 0 then
+                    decompressed = res
+                end
+            end
+            if not decompressed then
+                decompressed = LibDeflate:DecompressDeflate(decoded)
+            end
+            if not decompressed then return nil, "Failed to decompress data" end
+            decoded = nil
+            Yield(0.5)
+
+            -- Deserialize with the cooperative hook installed.
+            local dtotal = #decompressed
+            Serializer.SetYieldHook(function(pos)
+                Yield(0.5 + (pos / dtotal) * 0.5)
+            end)
+            local payload = Serializer.Deserialize(decompressed)
+            Serializer.SetYieldHook(nil)
+
+            if not payload or type(payload) ~= "table" then
+                return nil, "Failed to deserialize data"
+            end
+            if not payload.version or payload.version < 3 then
+                return nil, "This profile was created before the beta wipe and is no longer compatible. Please create a new export."
+            end
+            if payload.version > 3 then
+                return nil, "This profile was created with a newer version of EllesmereUI. Please update your addon."
+            end
+            return payload, nil
+        end)
+
+        local function Step()
+            if active ~= run then
+                if driver then driver:Hide() end
+                return
+            end
+            sliceStart = debugprofilestop()
+            local ok, payload, perr = coroutine.resume(run.co)
+            if not ok then
+                StopRun(run)
+                onDone(nil, "Failed to read import data")
+                return
+            end
+            if coroutine.status(run.co) == "dead" then
+                StopRun(run)
+                onDone(payload, perr)
+            end
+        end
+
+        if not driver then
+            driver = CreateFrame("Frame")
+            driver:Hide()
+        end
+        driver:SetScript("OnUpdate", Step)
+        driver:Show()
+
+        run.Cancel = function() StopRun(run) end
+        return run
+    end
+end
+
+-------------------------------------------------------------------------------
 --  Spell Layout string codec (CDM spell layouts -- SEPARATE from profiles)
 --
 --  Reuses the same serializer + deflate pipeline as profile export, but with a
@@ -1853,6 +2131,83 @@ function EllesmereUI.DecodeLayoutString(str)
     local payload = Serializer.Deserialize(decompressed)
     if type(payload) ~= "table" then return nil, "Failed to deserialize data" end
     return payload, nil
+end
+
+-------------------------------------------------------------------------------
+--  Imported media reconciliation
+--
+--  A profile string can reference SharedMedia statusbar textures that are
+--  not installed on the importing client. LSM silently substitutes its
+--  default texture in that case, so the import renders with swapped-in bars
+--  and no visible cue that files are missing. For media families known to
+--  ship as their own separate install, pin any dangling references to the
+--  "Texture Not Found" placeholder texture at import time instead: the
+--  affected bars render empty and the selection reads as exactly what
+--  happened (clearly missing rather than subtly wrong), and the user can
+--  pick any texture from the normal dropdowns afterwards.
+--
+--  One-shot by design: this rewrites only the incoming payload inside
+--  ImportProfile, before it is merged or stored. Existing profiles, presets,
+--  exports, profile sync and runtime media resolution are never touched.
+--  Media families are matched by signature; per repo convention third-party
+--  addon/pack names are not embedded in source.
+-------------------------------------------------------------------------------
+local RECONCILE_TEX_NAME = "Texture Not Found"
+local RECONCILE_TEX_PATH = [[Interface\AddOns\EllesmereUI\media\textures\blank.tga]]
+
+-- Register the placeholder through the same channel real media uses (LSM),
+-- so pinned values resolve everywhere -- every texture lookup table and
+-- dropdown picks it up -- with no special cases downstream.
+do
+    local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
+    if LSM then
+        LSM:Register(LSM.MediaType.STATUSBAR, RECONCILE_TEX_NAME, RECONCILE_TEX_PATH)
+    end
+end
+
+-- Signatures (djb2) of texture names known to ship as separate installs.
+local RECONCILE_BAR_SIGS = {
+    [3860001264] = true,
+    [1502800144] = true,
+    [1922316589] = true,
+    [3302863399] = true,
+    [2397640933] = true,
+    [3314165376] = true,
+    [2062452265] = true,
+}
+
+local function ReconcileImportedMedia(data)
+    if type(data) ~= "table" then return end
+    local LSM = LibStub and LibStub("LibSharedMedia-3.0", true)
+    if not LSM then return end
+
+    local function Signature(s)
+        local h = 5381
+        for i = 1, #s do
+            h = (h * 33 + s:byte(i)) % 4294967296
+        end
+        return h
+    end
+
+    local function Walk(t, depth)
+        if depth > 40 then return end
+        for k, v in pairs(t) do
+            if type(v) == "table" then
+                Walk(v, depth + 1)
+            elseif type(v) == "string" and #v >= 9 and #v <= 26 then
+                -- Saved texture values are either plain names or carry the
+                -- "sm:" dropdown key prefix.
+                local base = v:match("^sm:(.+)") or v
+                if RECONCILE_BAR_SIGS[Signature(base)] then
+                    if not LSM:Fetch("statusbar", base, true) then
+                        t[k] = "sm:" .. RECONCILE_TEX_NAME
+                    end
+                end
+            end
+        end
+    end
+
+    Walk(data, 1)
 end
 
 --- Reset class-dependent fill colors in Resource Bars after a profile import.
@@ -1906,7 +2261,15 @@ end
 --- Import a profile string. Returns: success, errorMsg
 --- The caller must provide a name for the new profile.
 function EllesmereUI.ImportProfile(importStr, profileName)
-    local payload, err = EllesmereUI.DecodeImportString(importStr)
+    -- Accepts either an encoded string or an already-decoded payload table.
+    -- The options import page decodes asynchronously and passes the table,
+    -- which skips a full re-encode/re-decode of the data at commit time.
+    local payload, err
+    if type(importStr) == "table" then
+        payload = importStr
+    else
+        payload, err = EllesmereUI.DecodeImportString(importStr)
+    end
     if not payload then return false, err end
 
     -- Normalize canonical (suite) addon keys -> this build's local db.folder
@@ -1915,6 +2278,10 @@ function EllesmereUI.ImportProfile(importStr, profileName)
     if payload.data and payload.data.addons then
         payload.data.addons = CanonToLocal(payload.data.addons)
     end
+
+    -- Reconcile media references against locally installed SharedMedia before
+    -- the payload is merged or stored (see Imported media reconciliation above).
+    ReconcileImportedMedia(payload.data)
 
     local db = GetProfilesDB()
 
@@ -1963,13 +2330,13 @@ function EllesmereUI.ImportProfile(importStr, profileName)
         if imported.fonts then merged.fonts = DeepCopy(imported.fonts) end
         if imported.customColors then merged.customColors = DeepCopy(imported.customColors) end
         if imported.darkMode then merged.darkMode = DeepCopy(imported.darkMode) end
-        if imported.specOverrides then merged.specOverrides = DeepCopy(imported.specOverrides) end
-        if imported.specOverrideGroups then
-            merged.specOverrideGroups = DeepCopy(imported.specOverrideGroups)
-            merged.specOverrideNextId = imported.specOverrideNextId
-        end
-        if imported.specUnlockOverrides then
-            merged.specUnlockOverrides = DeepCopy(imported.specUnlockOverrides)
+        -- Override stores: union-merge with incoming priority, the fork drop
+        -- rules, and a post-apply default re-baseline (kept stores' defaults
+        -- are stale against the imported values -- restoring them when an
+        -- override deactivates would overwrite the imported profile's own
+        -- settings). Full semantics in SpecOverrides_MergeImportedStores.
+        if EllesmereUI.SpecOverrides_MergeImportedStores then
+            EllesmereUI.SpecOverrides_MergeImportedStores(merged, imported)
         end
         -- Layout: the new profile's unlockLayout is the active profile's CURRENT
         -- layout, with the imported relationships merged in PER MODULE.
@@ -2061,6 +2428,13 @@ function EllesmereUI.ImportProfile(importStr, profileName)
                     -- relocate old-format imports the same way (idempotent).
                     if EllesmereUI.MigrateCdmHostedBuffSettings then
                         EllesmereUI.MigrateCdmHostedBuffSettings(specProf)
+                    end
+                    -- Strings exported before _buffDisplayOrderUserModified
+                    -- existed carry a drag-arranged buffDisplayOrder without
+                    -- the flag; stamp it or the first live reconcile resyncs
+                    -- the imported order to Blizzard order (idempotent).
+                    if EllesmereUI.MigrateCdmBuffOrderUserFlag then
+                        EllesmereUI.MigrateCdmBuffOrderUserFlag(specProf)
                     end
                 end
             end
@@ -2163,6 +2537,24 @@ function EllesmereUI.ImportProfile(importStr, profileName)
         if EllesmereUI.MigrateRBAdvancedProfile then
             EllesmereUI.MigrateRBAdvancedProfile(db.profiles[profileName])
         end
+        -- Re-bank override DEFAULTS from the freshly-applied imported values,
+        -- synchronously: it must land BEFORE SpecOverrides_Apply writes the
+        -- overlays back over live, and before the caller's ReloadUI (which
+        -- would destroy any deferred in-memory flag -- post-reload, login
+        -- overlays land before the first full refresh, so there is no clean
+        -- window after this one). Scoped to the folders the string actually
+        -- carried: non-imported folders keep the base profile's live tables,
+        -- which can hold ACTIVE override values that must never become
+        -- defaults.
+        if EllesmereUI.SpecOverrides_RebaselineDefaults then
+            local importedFolders = {}
+            if payload.data and payload.data.addons then
+                for folder in pairs(payload.data.addons) do importedFolders[folder] = true end
+            end
+            if next(importedFolders) then
+                EllesmereUI.SpecOverrides_RebaselineDefaults(importedFolders)
+            end
+        end
         -- Spec Overrides: apply the imported profile's stored values for the
         -- current spec on top of the just-applied addon data.
         if EllesmereUI.SpecOverrides_Apply then
@@ -2206,8 +2598,35 @@ function EllesmereUI.ImportProfile(importStr, profileName)
             merged.specOverrideGroups = DeepCopy(payload.data.specOverrideGroups)
             merged.specOverrideNextId = payload.data.specOverrideNextId
         end
+        if payload.data.condOverrideGroups then merged.condOverrideGroups = DeepCopy(payload.data.condOverrideGroups) end
+        if payload.data.condOverrides then merged.condOverrides = DeepCopy(payload.data.condOverrides) end
+        if payload.data.condUnlockOverrides then merged.condUnlockOverrides = DeepCopy(payload.data.condUnlockOverrides) end
         if payload.data.specUnlockOverrides then
             merged.specUnlockOverrides = DeepCopy(payload.data.specUnlockOverrides)
+        end
+        if payload.data.condBmOverrides then merged.condBmOverrides = DeepCopy(payload.data.condBmOverrides) end
+        if payload.data.specBmOverrides then
+            merged.specBmOverrides = DeepCopy(payload.data.specBmOverrides)
+        end
+        -- Kept override stores survive a partial import by design (the base
+        -- profile continues), but BM forks are Raid Frames-scoped: drop kept
+        -- ones when the payload replaces RF settings they were built against.
+        -- UN-PARKING NOTE: this branch only STORES the profile (never
+        -- activates it), so it must NOT call SpecOverrides_RebaselineDefaults
+        -- here -- that re-banks the ACTIVE profile's stores. When this branch
+        -- is revived, run the re-bank synchronously at activation time,
+        -- scoped to payload.data.addons folders (mirror the full-import call
+        -- after ApplyProfileData). Never a deferred flag: the import flow
+        -- ends in ReloadUI, which destroys in-memory state.
+        do
+            local folders = {}
+            if payload.data and payload.data.addons then
+                for folder in pairs(payload.data.addons) do folders[folder] = true end
+            end
+            if folders["EllesmereUIRaidFrames"] then
+                if not payload.data.specBmOverrides then merged.specBmOverrides = nil end
+                if not payload.data.condBmOverrides then merged.condBmOverrides = nil end
+            end
         end
         -- Resource Bars: migrate legacy Advanced data from old export strings.
         if EllesmereUI.MigrateRBAdvancedProfile then
@@ -2283,6 +2702,13 @@ end
 function EllesmereUI.SaveCurrentAsProfile(name)
     local db = GetProfilesDB()
     local current = db.activeProfile or "Default"
+    -- Freshen the override stores from live before snapshotting (same as the
+    -- export path): the whole-profile DeepCopy below carries every override
+    -- store with it, and without this bank the current spec's most recent
+    -- override edits could lag one harvest boundary behind.
+    if EllesmereUI.SpecOverrides_HarvestCurrent then
+        EllesmereUI.SpecOverrides_HarvestCurrent()
+    end
     local src = db.profiles[current]
 
     -- Count existing profiles BEFORE adding the new one
@@ -2428,6 +2854,13 @@ end
 function EllesmereUI.SwitchProfile(name)
     local db = GetProfilesDB()
     if not db.profiles[name] then return end
+
+    -- Close any editing-as session against the OUTGOING profile first (the
+    -- exits bank their edits), so the harvest below runs unguarded and the
+    -- post-switch establish never finds a live session.
+    if EllesmereUI.SpecOverrides_CloseEditSessions then
+        EllesmereUI.SpecOverrides_CloseEditSessions()
+    end
 
     -- Spec Overrides: sync the current spec's stored values with any live
     -- edits before leaving the outgoing profile (suppressed while a spec
@@ -3082,6 +3515,91 @@ end
 local SCROLL_STEP  = 45
 local SMOOTH_SPEED = 12
 
+-------------------------------------------------------------------------------
+--  Paste absorber for import edit boxes
+--
+--  Multiline edit boxes process pasted text one character at a time and
+--  re-layout after every one, so pasting a large profile string stalls the
+--  client for seconds -- and anything past the box's own cap is silently
+--  lost. The absorber keeps the visible box capped small while collecting
+--  the complete paste through OnChar into a plain Lua buffer: the box stays
+--  cheap to lay out, nothing is truncated, and once the paste settles the
+--  box shows a short summary line instead of the raw string.
+--
+--  local absorber = EllesmereUI.AttachImportPasteAbsorber(editBox, onRetry)
+--  absorber.GetText() -> the captured string, or the box's own (trimmed)
+--  text when nothing was absorbed. A manual user edit after a capture drops
+--  the capture (the user is starting over). onRetry (optional) is called if
+--  a paste overflowed the box without reaching the buffer; the cap is
+--  lifted so pasting again lands fully in the box.
+-------------------------------------------------------------------------------
+function EllesmereUI.AttachImportPasteAbsorber(editBox, onRetry)
+    local CAP = 2048
+    editBox:SetMaxLetters(0)
+    editBox:SetMaxBytes(CAP)
+
+    local buf, bufN, lastN = {}, 0, 0
+    local captured
+    local settingText = false
+
+    local function Finalize()
+        editBox:SetScript("OnUpdate", nil)
+        local s = strtrim(table.concat(buf, "", 1, bufN))
+        wipe(buf)
+        bufN, lastN = 0, 0
+        local boxText = editBox:GetText() or ""
+        if #s > #boxText then
+            -- The box rejected part of the paste; the buffer holds all of it.
+            captured = s
+            settingText = true
+            editBox:SetText(EllesmereUI.Lf("[ Import string captured (%1$s characters) ]", tostring(#s)))
+            editBox:SetCursorPosition(0)
+            settingText = false
+        elseif #boxText >= CAP then
+            -- The box filled to its cap but the buffer saw nothing beyond
+            -- it: the paste could not be absorbed. Lift the cap so a second
+            -- paste lands fully in the box (slower, but complete).
+            captured = nil
+            editBox:SetMaxBytes(0)
+            settingText = true
+            editBox:SetText("")
+            settingText = false
+            if onRetry then onRetry() end
+        else
+            captured = nil
+        end
+    end
+
+    editBox:HookScript("OnChar", function(_, c)
+        bufN = bufN + 1
+        buf[bufN] = c
+        if bufN == 1 then
+            lastN = 0
+            -- Finalize on the first frame where no further characters
+            -- arrived (a paste delivers its whole burst before then).
+            editBox:SetScript("OnUpdate", function()
+                if bufN == lastN then
+                    Finalize()
+                else
+                    lastN = bufN
+                end
+            end)
+        end
+    end)
+
+    editBox:HookScript("OnTextChanged", function(_, userInput)
+        if userInput and not settingText and captured then
+            captured = nil
+        end
+    end)
+
+    return {
+        GetText = function()
+            return captured or strtrim(editBox:GetText() or "")
+        end,
+    }
+end
+
 local function BuildStringPopup(title, subtitle, readOnly, onConfirm, confirmLabel)
     local POPUP_W, POPUP_H = 520, 310
     local FONT = EllesmereUI.EXPRESSWAY
@@ -3304,6 +3822,14 @@ local function BuildStringPopup(title, subtitle, readOnly, onConfirm, confirmLab
         RefreshHeight()
     end)
 
+    -- Absorb large pastes so the box never has to lay out a huge string
+    -- (import mode only; export boxes are read-only and set text directly).
+    -- Attached after the OnTextChanged SetScript above so the hook survives.
+    local absorber
+    if not readOnly then
+        absorber = EllesmereUI.AttachImportPasteAbsorber(editBox)
+    end
+
     -- Buttons
     if onConfirm then
         local confirmBtn = CreateFrame("Button", nil, popup)
@@ -3312,7 +3838,7 @@ local function BuildStringPopup(title, subtitle, readOnly, onConfirm, confirmLab
         confirmBtn:SetFrameLevel(popup:GetFrameLevel() + 2)
         EllesmereUI.MakeStyledButton(confirmBtn, confirmLabel or "Import", 11,
             EllesmereUI.WB_COLOURS, function()
-                local str = editBox:GetText()
+                local str = absorber and absorber.GetText() or editBox:GetText()
                 if str and #str > 0 then
                     dimmer:Hide()
                     onConfirm(str)

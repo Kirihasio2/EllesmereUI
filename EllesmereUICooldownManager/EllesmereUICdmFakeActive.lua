@@ -481,7 +481,16 @@ end
 PresetOnCD = function(key)
     local now = GetTime()
     if key > 0 then
-        local ci = C_Spell and C_Spell.GetSpellCooldown and C_Spell.GetSpellCooldown(key)
+        -- A transform's real CD ticks on the override ID (e.g. Rushing Wind
+        -- Kick over Rising Sun Kick); the base-ID query reads not-on-CD
+        -- through that whole CD.
+        local effKey = key
+        if C_SpellBook and C_SpellBook.FindSpellOverrideByID then
+            local ov = C_SpellBook.FindSpellOverrideByID(key)
+            if ov and ov > 0 and ov ~= key then effKey = ov end
+        end
+        local ci = C_Spell and C_Spell.GetSpellCooldown
+            and (C_Spell.GetSpellCooldown(effKey) or C_Spell.GetSpellCooldown(key))
         return (ci and ci.isActive and not ci.isOnGCD) or false
     end
 
@@ -836,6 +845,13 @@ end
 -- Re-arm on every CDM full rebuild, kept out of the (large) rebuild function.
 local _origFullCDMRebuild = ns.FullCDMRebuild
 ns.FullCDMRebuild = function(reason)
+    -- Rebuilds read transient cooldown states while re-rendering; open the
+    -- sound settle window first so re-primes can't false-arm ready sounds.
+    if ns._cdmBumpSoundSettle then ns._cdmBumpSoundSettle() end
+    -- Rebuilds are also the moments the tracked buff catalog can change
+    -- (talents/spec/settings) -- let the next reanchor reconcile the buff
+    -- display order.
+    ns._cdmBuffOrderDirty = true
     if _origFullCDMRebuild then _origFullCDMRebuild(reason) end
     ns.FakeActive_Rearm()
 end
