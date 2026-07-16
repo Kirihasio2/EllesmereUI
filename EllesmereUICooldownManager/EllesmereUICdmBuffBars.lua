@@ -2061,7 +2061,7 @@ local function ApplyTBBChargeHashLines(bar, cfg, maxCharges)
         if ticks then
             for i = 1, #ticks do ticks[i]:Hide() end
         end
-        bar._chargeHashGeometry = nil
+        bar._chargeHashLineCacheValid = nil
         if bar._chargeHashOverlay then bar._chargeHashOverlay:Hide() end
         return
     end
@@ -2072,7 +2072,7 @@ local function ApplyTBBChargeHashLines(bar, cfg, maxCharges)
             for i = 1, #ticks do ticks[i]:Hide() end
         end
         if bar._chargeHashOverlay then bar._chargeHashOverlay:Hide() end
-        bar._chargeHashGeometry = nil
+        bar._chargeHashLineCacheValid = nil
         return
     end
 
@@ -2084,10 +2084,20 @@ local function ApplyTBBChargeHashLines(bar, cfg, maxCharges)
     local lineA = cfg.chargeHashLineA
     if lineA == nil then lineA = 1 end
     local isVert = cfg.verticalOrientation and true or false
-    local geometry = table.concat({ maxCharges, width, isVert and 1 or 0,
-        string.format("%.3f", barW), string.format("%.3f", barH),
-        lineR, lineG, lineB, lineA }, ":")
-    if bar._chargeHashGeometry == geometry
+    local effectiveScale = sb:GetEffectiveScale() or 1
+    -- This function also runs from the shared timer tick. Keep the cache scalar:
+    -- synthesized table/string keys would generate garbage even on a cache hit.
+    if bar._chargeHashLineCacheValid
+       and bar._chargeHashLineMaxCharges == maxCharges
+       and bar._chargeHashLineWidth == width
+       and bar._chargeHashLineVertical == isVert
+       and bar._chargeHashLineBarW == barW
+       and bar._chargeHashLineBarH == barH
+       and bar._chargeHashLineScale == effectiveScale
+       and bar._chargeHashLineR == lineR
+       and bar._chargeHashLineG == lineG
+       and bar._chargeHashLineB == lineB
+       and bar._chargeHashLineA == lineA
        and bar._chargeHashOverlay and bar._chargeHashOverlay:IsShown() then
         return
     end
@@ -2134,28 +2144,61 @@ local function ApplyTBBChargeHashLines(bar, cfg, maxCharges)
         tick:Show()
     end
     for i = maxCharges, #ticks do ticks[i]:Hide() end
-    bar._chargeHashGeometry = geometry
+    bar._chargeHashLineCacheValid = true
+    bar._chargeHashLineMaxCharges = maxCharges
+    bar._chargeHashLineWidth = width
+    bar._chargeHashLineVertical = isVert
+    bar._chargeHashLineBarW = barW
+    bar._chargeHashLineBarH = barH
+    bar._chargeHashLineScale = effectiveScale
+    bar._chargeHashLineR = lineR
+    bar._chargeHashLineG = lineG
+    bar._chargeHashLineB = lineB
+    bar._chargeHashLineA = lineA
 end
 
-local function AnchorTBBSpark(bar, cfg, anchor, flushToEdge)
+local function AnchorTBBSparkState(bar, anchor, isVert, reverse, flushToEdge)
     local sb, spark = bar and bar._bar, bar and bar._spark
     if not sb or not spark or not anchor then return end
-    local isVert = cfg.verticalOrientation and true or false
+    isVert = isVert and true or false
+    reverse = reverse and true or false
+    flushToEdge = flushToEdge and true or false
+    local barW, barH = sb:GetWidth(), sb:GetHeight()
+    if bar._sparkAnchorTarget == anchor
+       and bar._sparkAnchorVertical == isVert
+       and bar._sparkAnchorReverse == reverse
+       and bar._sparkAnchorFlush == flushToEdge
+       and bar._sparkAnchorBarW == barW
+       and bar._sparkAnchorBarH == barH then
+        return
+    end
     if isVert then
-        spark:SetSize(sb:GetWidth(), 8)
+        spark:SetSize(barW, 8)
         spark:SetTexCoord(0, 1, 1, 1, 0, 0, 1, 0)
     else
-        spark:SetSize(8, sb:GetHeight())
+        spark:SetSize(8, barH)
         spark:SetTexCoord(0, 0, 0, 1, 1, 0, 1, 1)
     end
     spark:ClearAllPoints()
     if isVert then
-        spark:SetPoint("CENTER", anchor, cfg.reverseFill and "BOTTOM" or "TOP", 0, 0)
+        spark:SetPoint("CENTER", anchor, reverse and "BOTTOM" or "TOP", 0, 0)
     else
         spark:SetPoint("CENTER", anchor,
-            cfg.reverseFill and "LEFT" or "RIGHT",
-            flushToEdge and 0 or (cfg.reverseFill and 1 or -1), 0)
+            reverse and "LEFT" or "RIGHT",
+            flushToEdge and 0 or (reverse and 1 or -1), 0)
     end
+    bar._sparkAnchorTarget = anchor
+    bar._sparkAnchorVertical = isVert
+    bar._sparkAnchorReverse = reverse
+    bar._sparkAnchorFlush = flushToEdge
+    bar._sparkAnchorBarW = barW
+    bar._sparkAnchorBarH = barH
+end
+
+local function AnchorTBBSpark(bar, cfg, anchor, flushToEdge)
+    if not cfg then return end
+    AnchorTBBSparkState(bar, anchor, cfg.verticalOrientation,
+        cfg.reverseFill, flushToEdge)
 end
 
 -- Defined with the charge renderer below; ApplySettings calls it whenever a
@@ -2230,13 +2273,15 @@ local function ApplyTrackedBuffBarSettings(bar, cfg)
         sb:SetStatusBarTexture(texPath)
         bar._lastTexPath = texPath
     end
+    local fillTex = sb:GetStatusBarTexture()
+    bar._cachedOurFillTex = fillTex
 
     -- Fill color
     local fR = cfg.fillR or _classR
     local fG = cfg.fillG or _classG
     local fB = cfg.fillB or _classB
     local fA = cfg.fillA or 1
-    sb:GetStatusBarTexture():SetVertexColor(fR, fG, fB, fA)
+    fillTex:SetVertexColor(fR, fG, fB, fA)
     bar._baseFillR, bar._baseFillG, bar._baseFillB, bar._baseFillA = fR, fG, fB, fA
 
     -- Background
@@ -2245,7 +2290,6 @@ local function ApplyTrackedBuffBarSettings(bar, cfg)
     end
 
     -- Gradient
-    local fillTex = sb:GetStatusBarTexture()
     if cfg.gradientEnabled then
         local dir = cfg.gradientDir or "HORIZONTAL"
         fillTex:SetVertexColor(1, 1, 1, 0)
@@ -3555,19 +3599,23 @@ local function _ensureTBBChargeHashFill(bar)
     local countBar = CreateFrame("StatusBar", nil, sb)
     countBar:SetAllPoints(sb)
     countBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
-    countBar:GetStatusBarTexture():SetSnapToPixelGrid(false)
-    countBar:GetStatusBarTexture():SetTexelSnappingBias(0)
+    local countTexture = countBar:GetStatusBarTexture()
+    countTexture:SetSnapToPixelGrid(false)
+    countTexture:SetTexelSnappingBias(0)
     countBar:SetAlpha(0)
     countBar:EnableMouse(false)
     bar._chargeHashCountBar = countBar
+    bar._chargeHashCountTexture = countTexture
 
     local progressBar = CreateFrame("StatusBar", nil, sb)
     progressBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8x8")
-    progressBar:GetStatusBarTexture():SetSnapToPixelGrid(false)
-    progressBar:GetStatusBarTexture():SetTexelSnappingBias(0)
+    local progressTexture = progressBar:GetStatusBarTexture()
+    progressTexture:SetSnapToPixelGrid(false)
+    progressTexture:SetTexelSnappingBias(0)
     progressBar:SetAlpha(0)
     progressBar:EnableMouse(false)
     bar._chargeHashProgressBar = progressBar
+    bar._chargeHashProgressTexture = progressTexture
 
     local clip = CreateFrame("Frame", nil, sb)
     clip:SetClipsChildren(true)
@@ -3589,30 +3637,64 @@ local function _styleTBBChargeHashFill(bar, cfg)
     local texPath = bar._lastTexPath or "Interface\\Buttons\\WHITE8x8"
     local fR, fG = bar._baseFillR or _classR, bar._baseFillG or _classG
     local fB, fA = bar._baseFillB or _classB, bar._baseFillA or 1
-    local key = table.concat({ texPath, cfg.gradientEnabled and 1 or 0,
-        cfg.gradientDir or "HORIZONTAL", fR, fG, fB, fA,
-        cfg.gradientR or 0.20, cfg.gradientG or 0.20,
-        cfg.gradientB or 0.80, cfg.gradientA or 1 }, ":")
-    if bar._chargeHashFillStyle == key then return end
+    local gradientEnabled = cfg.gradientEnabled and true or false
+    local gradientDir = cfg.gradientDir or "HORIZONTAL"
+    local gR, gG = cfg.gradientR or 0.20, cfg.gradientG or 0.20
+    local gB, gA = cfg.gradientB or 0.80, cfg.gradientA or 1
+    -- Scalar style signature: unchanged active bars take this branch without
+    -- allocating a temporary table/key string every tick.
+    if bar._chargeHashFillStyleValid
+       and bar._chargeHashFillStyleTexPath == texPath
+       and bar._chargeHashFillStyleGradient == gradientEnabled
+       and bar._chargeHashFillStyleDirection == gradientDir
+       and bar._chargeHashFillStyleR == fR
+       and bar._chargeHashFillStyleG == fG
+       and bar._chargeHashFillStyleB == fB
+       and bar._chargeHashFillStyleA == fA
+       and bar._chargeHashFillStyleGradientR == gR
+       and bar._chargeHashFillStyleGradientG == gG
+       and bar._chargeHashFillStyleGradientB == gB
+       and bar._chargeHashFillStyleGradientA == gA then
+        return
+    end
 
     fill:SetTexture(texPath)
     fill:ClearAllPoints()
-    if cfg.gradientEnabled then
+    if gradientEnabled then
         -- Gradients stay mapped across the full bar and are revealed by the
         -- moving clip, matching the stock gradient path.
         fill:SetPoint("TOPLEFT", bar._bar, "TOPLEFT", 0, 0)
         fill:SetPoint("BOTTOMRIGHT", bar._bar, "BOTTOMRIGHT", 0, 0)
         fill:SetVertexColor(1, 1, 1, 1)
-        fill:SetGradient(cfg.gradientDir or "HORIZONTAL",
-            CreateColor(fR, fG, fB, fA),
-            CreateColor(cfg.gradientR or 0.20, cfg.gradientG or 0.20,
-                cfg.gradientB or 0.80, cfg.gradientA or 1))
+        local c1 = bar._chargeHashGradientColor1
+        local c2 = bar._chargeHashGradientColor2
+        if not c1 then
+            c1 = CreateColor(fR, fG, fB, fA)
+            c2 = CreateColor(gR, gG, gB, gA)
+            bar._chargeHashGradientColor1 = c1
+            bar._chargeHashGradientColor2 = c2
+        else
+            c1.r, c1.g, c1.b, c1.a = fR, fG, fB, fA
+            c2.r, c2.g, c2.b, c2.a = gR, gG, gB, gA
+        end
+        fill:SetGradient(gradientDir, c1, c2)
     else
         -- Plain/patterned StatusBar textures stretch with the visible fill.
         fill:SetAllPoints(bar._chargeHashFillClip)
         fill:SetVertexColor(fR, fG, fB, fA)
     end
-    bar._chargeHashFillStyle = key
+    bar._chargeHashFillStyleValid = true
+    bar._chargeHashFillStyleTexPath = texPath
+    bar._chargeHashFillStyleGradient = gradientEnabled
+    bar._chargeHashFillStyleDirection = gradientDir
+    bar._chargeHashFillStyleR = fR
+    bar._chargeHashFillStyleG = fG
+    bar._chargeHashFillStyleB = fB
+    bar._chargeHashFillStyleA = fA
+    bar._chargeHashFillStyleGradientR = gR
+    bar._chargeHashFillStyleGradientG = gG
+    bar._chargeHashFillStyleGradientB = gB
+    bar._chargeHashFillStyleGradientA = gA
 end
 
 _restoreTBBNormalFill = function(bar, cfg)
@@ -3622,7 +3704,11 @@ _restoreTBBNormalFill = function(bar, cfg)
     if bar._chargeHashProgressBar then bar._chargeHashProgressBar:Hide() end
 
     local sb = bar._bar
-    local fillTex = sb and sb:GetStatusBarTexture()
+    local fillTex = bar._cachedOurFillTex
+    if not fillTex and sb then
+        fillTex = sb:GetStatusBarTexture()
+        bar._cachedOurFillTex = fillTex
+    end
     if fillTex then fillTex:SetAlpha(1) end
     if bar._gradientActive and bar._gradClip then bar._gradClip:Show() end
     if cfg.showSpark and fillTex then
@@ -3653,72 +3739,81 @@ local function _updateTBBChargeHashFill(bar, cfg, maxCharges, currentCharges,
     local sb = bar._bar
     local countBar = bar._chargeHashCountBar
     local progressBar = bar._chargeHashProgressBar
+    local countTexture = bar._chargeHashCountTexture
+    local progressTexture = bar._chargeHashProgressTexture
     local clip = bar._chargeHashFillClip
-    if not sb or not countBar or not progressBar or not clip then return false end
+    if not sb or not countBar or not progressBar or not countTexture
+       or not progressTexture or not clip then return false end
 
     local isVert = cfg.verticalOrientation and true or false
     local reverse = cfg.reverseFill and true or false
     local orientation = isVert and "VERTICAL" or "HORIZONTAL"
-    local geometry = table.concat({ maxCharges, isVert and 1 or 0,
-        reverse and 1 or 0, string.format("%.3f", sb:GetWidth()),
-        string.format("%.3f", sb:GetHeight()) }, ":")
-    if bar._chargeHashFillGeometry ~= geometry then
+    local barW, barH = sb:GetWidth(), sb:GetHeight()
+    -- Direct scalar comparisons preserve every geometry invalidator while
+    -- keeping the steady-state update allocation-free.
+    if not bar._chargeHashFillGeometryValid
+       or bar._chargeHashFillMaxCharges ~= maxCharges
+       or bar._chargeHashFillVertical ~= isVert
+       or bar._chargeHashFillReverse ~= reverse
+       or bar._chargeHashFillBarW ~= barW
+       or bar._chargeHashFillBarH ~= barH then
         countBar:SetOrientation(orientation)
         countBar:SetReverseFill(reverse)
         countBar:SetMinMaxValues(0, maxCharges)
 
-        local countFill = countBar:GetStatusBarTexture()
         progressBar:ClearAllPoints()
         progressBar:SetOrientation(orientation)
         progressBar:SetReverseFill(reverse)
         progressBar:SetMinMaxValues(0, 1)
         if isVert then
-            progressBar:SetHeight(sb:GetHeight() / maxCharges)
+            progressBar:SetHeight(barH / maxCharges)
             if reverse then
-                progressBar:SetPoint("TOPLEFT", countFill, "BOTTOMLEFT", 0, 0)
-                progressBar:SetPoint("TOPRIGHT", countFill, "BOTTOMRIGHT", 0, 0)
+                progressBar:SetPoint("TOPLEFT", countTexture, "BOTTOMLEFT", 0, 0)
+                progressBar:SetPoint("TOPRIGHT", countTexture, "BOTTOMRIGHT", 0, 0)
             else
-                progressBar:SetPoint("BOTTOMLEFT", countFill, "TOPLEFT", 0, 0)
-                progressBar:SetPoint("BOTTOMRIGHT", countFill, "TOPRIGHT", 0, 0)
+                progressBar:SetPoint("BOTTOMLEFT", countTexture, "TOPLEFT", 0, 0)
+                progressBar:SetPoint("BOTTOMRIGHT", countTexture, "TOPRIGHT", 0, 0)
             end
         else
-            progressBar:SetWidth(sb:GetWidth() / maxCharges)
+            progressBar:SetWidth(barW / maxCharges)
             if reverse then
-                progressBar:SetPoint("TOPRIGHT", countFill, "TOPLEFT", 0, 0)
-                progressBar:SetPoint("BOTTOMRIGHT", countFill, "BOTTOMLEFT", 0, 0)
+                progressBar:SetPoint("TOPRIGHT", countTexture, "TOPLEFT", 0, 0)
+                progressBar:SetPoint("BOTTOMRIGHT", countTexture, "BOTTOMLEFT", 0, 0)
             else
-                progressBar:SetPoint("TOPLEFT", countFill, "TOPRIGHT", 0, 0)
-                progressBar:SetPoint("BOTTOMLEFT", countFill, "BOTTOMRIGHT", 0, 0)
+                progressBar:SetPoint("TOPLEFT", countTexture, "TOPRIGHT", 0, 0)
+                progressBar:SetPoint("BOTTOMLEFT", countTexture, "BOTTOMRIGHT", 0, 0)
             end
         end
 
-        local progressFill = progressBar:GetStatusBarTexture()
         clip:ClearAllPoints()
         if isVert then
             if reverse then
                 clip:SetPoint("TOPRIGHT", sb, "TOPRIGHT", 0, 0)
-                clip:SetPoint("BOTTOMLEFT", progressFill, "BOTTOMLEFT", 0, 0)
+                clip:SetPoint("BOTTOMLEFT", progressTexture, "BOTTOMLEFT", 0, 0)
             else
                 clip:SetPoint("BOTTOMLEFT", sb, "BOTTOMLEFT", 0, 0)
-                clip:SetPoint("TOPRIGHT", progressFill, "TOPRIGHT", 0, 0)
+                clip:SetPoint("TOPRIGHT", progressTexture, "TOPRIGHT", 0, 0)
             end
         else
             if reverse then
-                clip:SetPoint("TOPLEFT", progressFill, "TOPLEFT", 0, 0)
+                clip:SetPoint("TOPLEFT", progressTexture, "TOPLEFT", 0, 0)
                 clip:SetPoint("BOTTOMRIGHT", sb, "BOTTOMRIGHT", 0, 0)
             else
                 clip:SetPoint("TOPLEFT", sb, "TOPLEFT", 0, 0)
-                clip:SetPoint("BOTTOMRIGHT", progressFill, "BOTTOMRIGHT", 0, 0)
+                clip:SetPoint("BOTTOMRIGHT", progressTexture, "BOTTOMRIGHT", 0, 0)
             end
         end
-        bar._chargeHashFillGeometry = geometry
+        bar._chargeHashFillGeometryValid = true
+        bar._chargeHashFillMaxCharges = maxCharges
+        bar._chargeHashFillVertical = isVert
+        bar._chargeHashFillReverse = reverse
+        bar._chargeHashFillBarW = barW
+        bar._chargeHashFillBarH = barH
     end
 
     -- SetValue is a supported secret sink: never inspect or calculate with the
     -- live count in Lua.
     countBar:SetValue(currentCharges)
-    countBar:Show()
-    progressBar:Show()
 
     if durObj and progressBar.SetTimerDuration and Enum
        and Enum.StatusBarTimerDirection then
@@ -3736,17 +3831,26 @@ local function _updateTBBChargeHashFill(bar, cfg, maxCharges, currentCharges,
     end
 
     _styleTBBChargeHashFill(bar, cfg)
-    local fillTex = sb:GetStatusBarTexture()
-    if fillTex then fillTex:SetAlpha(0) end
-    if bar._gradClip then bar._gradClip:Hide() end
-    clip:Show()
+    local activating = not bar._chargeHashFillActive
+    if activating then
+        countBar:Show()
+        progressBar:Show()
+        local fillTex = bar._cachedOurFillTex
+        if not fillTex then
+            fillTex = sb:GetStatusBarTexture()
+            bar._cachedOurFillTex = fillTex
+        end
+        if fillTex then fillTex:SetAlpha(0) end
+        if bar._gradClip then bar._gradClip:Hide() end
+        clip:Show()
+    end
     if cfg.showSpark and bar._spark then
         -- Anchor to the actual native progress texture, not the intermediate
         -- clip frame. Its moving edge is also the exact visible fill boundary;
         -- avoiding the frame's pixel rounding keeps the spark physically joined
         -- to that edge in both normal and reverse fill.
-        AnchorTBBSpark(bar, cfg, progressBar:GetStatusBarTexture(), true)
-        bar._spark:Show()
+        AnchorTBBSpark(bar, cfg, progressTexture, true)
+        if not bar._spark:IsShown() then bar._spark:Show() end
     end
     bar._chargeHashFillActive = true
     bar._cdNeedSet = nil
@@ -4248,7 +4352,7 @@ local function _UpdateCooldownBar(bar, cfg)
     if bar._timerText then
         if remaining and cfg.showTimer then
             if hashChargeMode then
-                bar._timerText:SetText(string.format("%.1f", remaining))
+                bar._timerText:SetFormattedText("%.1f", remaining)
             elseif remaining < 10 then
                 bar._timerText:SetText(string.format("%.1f", remaining))
             else
@@ -4717,30 +4821,22 @@ function ns.UpdateTrackedBuffBarTimers()
         end
     end
 
-    -- Spark re-anchor: use cached texture ref to avoid GetStatusBarTexture() alloc.
-    -- SetPoint on an already-anchored spark to the same anchor is a no-op internally.
+    -- Normal-fill spark maintenance. Hash-fill sparks are anchored directly by
+    -- their renderer; both paths use AnchorTBBSparkState's scalar signature so
+    -- unchanged anchors do no native layout work and allocate nothing.
     for _, bar in ipairs(tbbFrames) do
         if bar and bar._spark and bar._spark:IsShown() and bar._bar then
-            local hashFillActive = bar._chargeHashFillActive
-                and bar._chargeHashProgressBar
-            local anchor
-            if hashFillActive then
-                -- The hash composite's true moving edge. Do not replace this
-                -- with the hidden stock fill during the maintenance pass.
-                anchor = bar._chargeHashProgressBar:GetStatusBarTexture()
-            else
-                anchor = (bar._gradientActive and bar._gradClip) or bar._cachedOurFillTex
+            if not bar._chargeHashFillActive then
+                local anchor = (bar._gradientActive and bar._gradClip)
+                    or bar._cachedOurFillTex
                 if not anchor then
                     anchor = bar._bar:GetStatusBarTexture()
                     bar._cachedOurFillTex = anchor
                 end
-            end
-            if anchor then
-                bar._spark:SetPoint("CENTER", anchor,
-                    bar._lastVertical and (bar._lastReverse and "BOTTOM" or "TOP")
-                        or (bar._lastReverse and "LEFT" or "RIGHT"),
-                    (bar._lastVertical or hashFillActive) and 0
-                        or (bar._lastReverse and 1 or -1), 0)
+                if anchor then
+                    AnchorTBBSparkState(bar, anchor, bar._lastVertical,
+                        bar._lastReverse, false)
+                end
             end
         end
     end
